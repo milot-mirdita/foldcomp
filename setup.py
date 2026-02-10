@@ -7,7 +7,7 @@ setup(
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     author="Milot Mirdita <milot@mirdita.de>, Hyunbin Kim <khb7840@gmail.com>, Martin Steinegger <themartinsteinegger@gmail.com>",
-    license="GPLv3",
+    license="MIT",
     cmake_args=["-DBUILD_PYTHON:BOOL=ON"],
     python_requires=">=3.7",
     packages=["foldcomp"],
