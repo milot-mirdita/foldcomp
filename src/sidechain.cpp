@@ -174,7 +174,16 @@ std::vector< std::vector<float> > calculateSideChainTorsionAnglesPerResidue(
     std::vector<std::vector<float>> output;
     output.reserve(atomByResidue.size());
     for (const auto& residue : atomByResidue) {
-        output.emplace_back(calculateTorsionAnglesInResidue(residue, AAmap.at(residue[0].residue)));
+        if (residue.empty()) {
+            output.emplace_back();
+            continue;
+        }
+        const auto it = AAmap.find(residue[0].residue);
+        if (it == AAmap.end()) {
+            output.emplace_back();
+            continue;
+        }
+        output.emplace_back(calculateTorsionAnglesInResidue(residue, it->second));
     }
     return output;
 }

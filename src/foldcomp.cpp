@@ -449,32 +449,93 @@ void printCompressedResidue(BackboneChain& res) {
 
 int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
     int success = 0;
-    this->compressedBackBone.resize(atoms.size());
-    this->compressedSideChain.resize(atoms.size());
+    if (atoms.empty()) {
+        return -1;
+    }
+    this->isPreprocessed = false;
+    this->isCompressed = false;
+    this->compressedBackBone.clear();
+    this->compressedSideChain.clear();
+    this->residues.clear();
+    this->residueThreeLetter.clear();
+    this->backboneTorsionAngles.clear();
+    this->backboneBondAngles.clear();
+    this->psi.clear();
+    this->omega.clear();
+    this->phi.clear();
+    this->n_ca_c_angle.clear();
+    this->ca_c_n_angle.clear();
+    this->c_n_ca_angle.clear();
+    this->psiDiscretized.clear();
+    this->omegaDiscretized.clear();
+    this->phiDiscretized.clear();
+    this->n_ca_c_angleDiscretized.clear();
+    this->ca_c_n_angleDiscretized.clear();
+    this->c_n_ca_angleDiscretized.clear();
+    this->sideChainAnglesPerResidue.clear();
+    this->sideChainAnglesDiscretized.clear();
+    this->tempFactors.clear();
+    this->tempFactorsDiscretized.clear();
+    this->anchorAtoms.clear();
+    this->anchorCoordinates.clear();
+    this->anchorIndices.clear();
 
     // Discretize
-    // Extract backbone
-    this->backbone = filterBackbone(atoms);
+    // Keep only residues with complete backbone (N/CA/C).
+    std::vector<AtomCoordinate> encodableAtoms;
+    std::vector<std::vector<AtomCoordinate>> residueAtoms = splitAtomByResidue(atoms);
+    for (const auto& residue : residueAtoms) {
+        bool hasN = false;
+        bool hasCA = false;
+        bool hasC = false;
+        for (const auto& atom : residue) {
+            if (atom.atom == "N") {
+                hasN = true;
+            } else if (atom.atom == "CA") {
+                hasCA = true;
+            } else if (atom.atom == "C") {
+                hasC = true;
+            }
+        }
+        if (hasN && hasCA && hasC) {
+            encodableAtoms.insert(encodableAtoms.end(), residue.begin(), residue.end());
+        }
+    }
+    if (encodableAtoms.empty()) {
+        return -1;
+    }
+
+    this->backbone = filterBackbone(encodableAtoms);
+    if (this->backbone.size() < 6 || (this->backbone.size() % 3) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < this->backbone.size(); i += 3) {
+        if (this->backbone[i].atom != "N" ||
+            this->backbone[i + 1].atom != "CA" ||
+            this->backbone[i + 2].atom != "C") {
+            return -1;
+        }
+    }
 
     // this->title = this->strTitle.c_str();
     this->lenTitle = this->strTitle.size();
 
     this->nResidue = this->backbone.size() / 3;
     this->nBackbone = this->backbone.size();
-    this->nAtom = atoms.size();
-    this->idxResidue = atoms[0].residue_index;
-    this->idxAtom = atoms[0].atom_index;
-    this->chain = atoms[0].chain.c_str()[0];
-    this->firstResidue = getOneLetterCode(atoms[0].residue);
-    this->lastResidue = getOneLetterCode(atoms[atoms.size() - 1].residue);
+    this->nAtom = encodableAtoms.size();
+    this->idxResidue = this->backbone[0].residue_index;
+    this->idxAtom = this->backbone[0].atom_index;
+    this->chain = this->backbone[0].chain.c_str()[0];
+    this->firstResidue = getOneLetterCode(this->backbone[0].residue);
+    this->lastResidue = getOneLetterCode(this->backbone[this->backbone.size() - 1].residue);
 
     // Anchor atoms
-    this->_setAnchor(atoms);
+    this->_setAnchor();
 
-    if (atoms[atoms.size() - 1].atom == "OXT") {
+    if (encodableAtoms[encodableAtoms.size() - 1].atom == "OXT") {
         this->hasOXT = 1;
-        this->OXT = atoms[atoms.size() - 1];
-        this->OXT_coords = atoms[atoms.size() - 1].coordinate;
+        this->OXT = encodableAtoms[encodableAtoms.size() - 1];
+        this->OXT_coords = encodableAtoms[encodableAtoms.size() - 1].coordinate;
     } else {
         this->hasOXT = 0;
         this->OXT = AtomCoordinate();
@@ -519,13 +580,13 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
     this->c_n_ca_angleDiscretized = this->c_n_ca_angleDisc.discretize(this->c_n_ca_angle);
 
     // Set residue names
-    this->residueThreeLetter = getResidueNameVector(atoms);
+    this->residueThreeLetter = getResidueNameVector(encodableAtoms);
 
     // Set Discretizer for side chain
     this->sideChainDiscMap = initializeSideChainDiscMap();
     // Calculate side chain info
 
-    this->sideChainAnglesPerResidue = calculateSideChainTorsionAnglesPerResidue(atoms, this->AAS);
+    this->sideChainAnglesPerResidue = calculateSideChainTorsionAnglesPerResidue(encodableAtoms, this->AAS);
 
     // Discretize side chain
     //this->_discretizeSideChainTorsionAngles(this->sideChainAnglesPerResidue, this->sideChainAnglesDiscretized);
@@ -540,9 +601,9 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
 
     // Get tempFactors
     // 2022-08-31 16:28:30 - Changed to save one tempFactor per residue
-    for (size_t i = 0; i < atoms.size(); i++) {
-        if (atoms[i].atom == "CA") {
-            this->tempFactors.push_back(atoms[i].tempFactor);
+    for (size_t i = 0; i < encodableAtoms.size(); i++) {
+        if (encodableAtoms[i].atom == "CA") {
+            this->tempFactors.push_back(encodableAtoms[i].tempFactor);
         }
     }
     // Discretize
@@ -565,9 +626,14 @@ std::vector<BackboneChain> Foldcomp::compress(const tcb::span<AtomCoordinate>& a
     // CURRENT VERSION - 2022-01-10 15:34:21
     // IGNORE BREAKS
     if (!this->isPreprocessed) {
-        this->preprocess(atoms);
+        if (this->preprocess(atoms) != 0) {
+            return output;
+        }
     }
-    this->prevAtoms = {atoms[0], atoms[1], atoms[2]};
+    if (atoms.size() < 3 || this->backbone.size() < 3 || this->nResidue <= 0) {
+        return output;
+    }
+    this->prevAtoms = {this->backbone[0], this->backbone[1], this->backbone[2]};
 
     AtomCoordinate currN;
     char currResCode;
@@ -742,7 +808,7 @@ int Foldcomp::_getAnchorNum(int threshold) {
     return nAnchor;
 }
 
-void Foldcomp::_setAnchor(const tcb::span<AtomCoordinate>& atomCoordinates) {
+void Foldcomp::_setAnchor() {
     this->nInnerAnchor = this->_getAnchorNum(this->anchorThreshold);
     this->nAllAnchor = this->nInnerAnchor + 2; // Start and end
     // Set the anchor points - residue index
@@ -753,11 +819,26 @@ void Foldcomp::_setAnchor(const tcb::span<AtomCoordinate>& atomCoordinates) {
     }
     this->anchorIndices.push_back(this->nResidue - 1);
     //
-    std::vector<int> anchorResidueIndices;
+    this->anchorAtoms.clear();
+    this->anchorAtoms.reserve(this->anchorIndices.size());
     for (size_t i = 0; i < this->anchorIndices.size(); i++) {
-        anchorResidueIndices.push_back(this->anchorIndices[i] + this->idxResidue);
+        size_t idx = static_cast<size_t>(this->anchorIndices[i]) * 3;
+        if (idx + 2 < this->backbone.size()) {
+            this->anchorAtoms.push_back({
+                this->backbone[idx],
+                this->backbone[idx + 1],
+                this->backbone[idx + 2]
+            });
+        } else if (this->backbone.size() >= 3) {
+            this->anchorAtoms.push_back({
+                this->backbone[this->backbone.size() - 3],
+                this->backbone[this->backbone.size() - 2],
+                this->backbone[this->backbone.size() - 1]
+            });
+        } else {
+            this->anchorAtoms.push_back({});
+        }
     }
-    this->anchorAtoms = getAtomsWithResidueIndex(atomCoordinates, anchorResidueIndices);
 }
 
 std::vector<float> Foldcomp::checkTorsionReconstruction() {
@@ -870,11 +951,15 @@ int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
         if (i != 0){
             currResidue = backBonePerResidue[i][0].residue;
         }
+        const auto aaIt = AAS.find(currResidue);
+        if (aaIt == AAS.end()) {
+            continue;
+        }
         fullResidue = nerf.reconstructAminoAcid(
-            backBonePerResidue[i], this->sideChainAnglesPerResidue[i], AAS.at(currResidue)
+            backBonePerResidue[i], this->sideChainAnglesPerResidue[i], aaIt->second
         );
         if (this->useAltAtomOrder) {
-            _reorderAtoms(fullResidue, AAS.at(currResidue));
+            _reorderAtoms(fullResidue, aaIt->second);
         }
         backBonePerResidue[i] = fullResidue;
     }
@@ -1052,9 +1137,17 @@ int Foldcomp::writeStream(std::ostream& os) {
     // TODO: NEED TO BE CHECKED
     for (const auto& anchors : this->anchorAtoms) {
         for (int i = 0; i < 3; i++) {
-            os.write((char*)&anchors[i].coordinate.x, sizeof(float));
-            os.write((char*)&anchors[i].coordinate.y, sizeof(float));
-            os.write((char*)&anchors[i].coordinate.z, sizeof(float));
+            float3d coord;
+            if ((size_t)i < anchors.size()) {
+                coord = anchors[i].coordinate;
+            } else if (!anchors.empty()) {
+                coord = anchors.back().coordinate;
+            } else {
+                coord = {0.0f, 0.0f, 0.0f};
+            }
+            os.write((char*)&coord.x, sizeof(float));
+            os.write((char*)&coord.y, sizeof(float));
+            os.write((char*)&coord.z, sizeof(float));
         }
     }
 
@@ -1135,9 +1228,17 @@ int Foldcomp::writeTar(mtar_t& tar, std::string filename, size_t size) {
     // Write anchor atoms
     for (const auto& anchors : this->anchorAtoms) {
         for (int i = 0; i < 3; i++) {
-            mtar_write_data(&tar, &anchors[i].coordinate.x, sizeof(float));
-            mtar_write_data(&tar, &anchors[i].coordinate.y, sizeof(float));
-            mtar_write_data(&tar, &anchors[i].coordinate.z, sizeof(float));
+            float3d coord;
+            if ((size_t)i < anchors.size()) {
+                coord = anchors[i].coordinate;
+            } else if (!anchors.empty()) {
+                coord = anchors.back().coordinate;
+            } else {
+                coord = {0.0f, 0.0f, 0.0f};
+            }
+            mtar_write_data(&tar, &coord.x, sizeof(float));
+            mtar_write_data(&tar, &coord.y, sizeof(float));
+            mtar_write_data(&tar, &coord.z, sizeof(float));
         }
     }
     // Write hasOXT
@@ -1338,13 +1439,15 @@ int Foldcomp::extract(std::string& data, int type, int digits) {
 
 //
 CompressedFileHeader Foldcomp::get_header() {
-    CompressedFileHeader header;
+    CompressedFileHeader header = {};
     // counts
     header.nResidue = this->nResidue;
     header.nAtom = this->nAtom;
     header.idxResidue = this->idxResidue;
     header.idxAtom = this->idxAtom;
     header.nAnchor = this->nAllAnchor;
+    header.version = 0;
+    header.flags = 0;
     header.nSideChainTorsion = this->nSideChainTorsion;
     header.firstResidue = this->firstResidue;
     header.lastResidue = this->lastResidue;

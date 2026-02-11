@@ -20,6 +20,7 @@
 #include "gemmi/gz.hpp"
 #include "gemmi/input.hpp"
 #include "gemmi/mmread.hpp"
+#include "gemmi/resinfo.hpp"
 
 /**
  * @brief StructureReader::updateStructure
@@ -44,15 +45,38 @@ void StructureReader::updateStructure(void* void_st, const std::string& filename
         this->title = filename;
     }
 
-    for (gemmi::Model& model : st->models) {
+    for (size_t modelIndex = 0; modelIndex < st->models.size(); modelIndex++) {
+        gemmi::Model& model = st->models[modelIndex];
         for (gemmi::Chain& ch : model.chains) {
             for (gemmi::Residue& res : ch.residues) {
+                gemmi::ResidueInfo resInfo = gemmi::find_tabulated_residue(res.name);
+                bool isProteinLike = resInfo.found() && resInfo.is_amino_acid();
+                if (!isProteinLike) {
+                    // Fallback for modified/unknown polymer residues with peptide backbone atoms.
+                    bool hasN = false;
+                    bool hasCA = false;
+                    bool hasC = false;
+                    for (const gemmi::Atom& atom : res.atoms) {
+                        if (atom.name == "N") {
+                            hasN = true;
+                        } else if (atom.name == "CA") {
+                            hasCA = true;
+                        } else if (atom.name == "C") {
+                            hasC = true;
+                        }
+                    }
+                    isProteinLike = (res.entity_type == gemmi::EntityType::Polymer && hasN && hasCA && hasC);
+                }
+                if (!isProteinLike) {
+                    continue;
+                }
                 for (gemmi::Atom& atom : res.atoms) {
                     AtomCoordinate ac = AtomCoordinate(
                         atom.name, res.name, ch.name, atom.serial, (int)res.seqid.num,
                         (float)atom.pos.x, (float)atom.pos.y, (float)atom.pos.z
                     );
                     ac.tempFactor = atom.b_iso;
+                    ac.model = static_cast<int>(modelIndex + 1);
                     this->atoms.push_back(ac);
                 }
             }
@@ -91,7 +115,7 @@ bool StructureReader::loadFromBuffer(const char* buffer, size_t bufferSize, cons
 
         updateStructure((void*)&st, name);
     }
-    catch (std::runtime_error& e) {
+    catch (const std::exception&) {
         return false;
     }
     return true;
@@ -128,7 +152,7 @@ bool StructureReader::load(const std::string& filename){
         gemmi::Structure st = openStructure(filename);
         updateStructure((void*)&st, filename);
     }
-    catch (std::runtime_error& e) {
+    catch (const std::exception&) {
         return false;
     }
     return true;

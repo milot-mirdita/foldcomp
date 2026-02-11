@@ -47,6 +47,9 @@ std::vector<float> getTorsionFromXYZ(
     const std::vector<float3d>& coordinates, int atm_inc = 1
 ) {
     std::vector<float> torsion_vector;
+    if (coordinates.size() < 4 || atm_inc <= 0) {
+        return torsion_vector;
+    }
     for (size_t i = 0; i < (coordinates.size() - 3); i += atm_inc) {
         // 00. Get 4 atom coordinates
         float3d atm_1 = coordinates[i + 0];

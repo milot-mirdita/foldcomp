@@ -26,12 +26,14 @@ public:
     AtomCoordinate(
         std::string a, std::string r, std::string c,
         int ai, int ri, float x, float y, float z,
-        float occupancy = 0.0f, float tempFactor = 0.0f
+        float occupancy = 0.0f, float tempFactor = 0.0f,
+        int model = 1
     );
     AtomCoordinate(
         std::string a, std::string r, std::string c,
         int ai, int ri, float3d coord,
-        float occupancy = 0.0f, float tempFactor = 0.0f
+        float occupancy = 0.0f, float tempFactor = 0.0f,
+        int model = 1
     );
     // data
     std::string atom;
@@ -42,6 +44,7 @@ public:
     float3d coordinate;
     float occupancy;
     float tempFactor;
+    int model = 1;
 
     // operators
     bool operator==(const AtomCoordinate& other) const;

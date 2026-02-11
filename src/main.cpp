@@ -29,8 +29,11 @@
 #include "input_processor.h"
 
 // Standard libraries
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <fstream> // IWYU pragma: keep
+#include <iomanip>
 #ifdef _WIN32
 #include <direct.h>
 #include "windows/getopt.h"
@@ -40,6 +43,7 @@
 #endif
 #include <iostream>
 #include <sstream> // IWYU pragma: keep
+#include <set>
 #include <string>
 #include <vector>
 
@@ -61,6 +65,212 @@ static int overwrite = 0;
 
 // version
 #define FOLDCOMP_VERSION "1.0.0"
+static constexpr uint8_t FOLDCOMP_FORMAT_VERSION_CONTAINER = 1;
+static constexpr uint8_t FOLDCOMP_FORMAT_FLAG_CONTAINER = 1;
+
+struct ContainerFragment {
+    int16_t model = 1;
+    std::string chain;
+    std::string payload;
+};
+
+struct DecompressedSegment {
+    int model = 1;
+    std::vector<AtomCoordinate> atoms;
+};
+
+template <typename T>
+static bool readBinaryValue(const char* data, size_t size, size_t& offset, T& out) {
+    if (offset + sizeof(T) > size) {
+        return false;
+    }
+    memcpy(&out, data + offset, sizeof(T));
+    offset += sizeof(T);
+    return true;
+}
+
+static bool hasFoldcompMagic(const char* data, size_t size) {
+    if (size < MAGICNUMBER_LENGTH) {
+        return false;
+    }
+    return memcmp(data, MAGICNUMBER, MAGICNUMBER_LENGTH) == 0;
+}
+
+static bool isContainerHeader(const CompressedFileHeader& header) {
+    return header.version == FOLDCOMP_FORMAT_VERSION_CONTAINER &&
+           (header.flags & FOLDCOMP_FORMAT_FLAG_CONTAINER) != 0 &&
+           header.nResidue == 0 &&
+           header.nAtom == 0;
+}
+
+static bool writeContainer(
+    std::ostream& os, const std::string& title,
+    const std::vector<ContainerFragment>& fragments
+) {
+    CompressedFileHeader header = {};
+    header.version = FOLDCOMP_FORMAT_VERSION_CONTAINER;
+    header.flags = FOLDCOMP_FORMAT_FLAG_CONTAINER;
+    header.lenTitle = static_cast<uint32_t>(title.size());
+
+    os.write(MAGICNUMBER, MAGICNUMBER_LENGTH);
+    os.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    uint32_t nFragments = static_cast<uint32_t>(fragments.size());
+    os.write(reinterpret_cast<const char*>(&nFragments), sizeof(nFragments));
+    if (!title.empty()) {
+        os.write(title.data(), static_cast<std::streamsize>(title.size()));
+    }
+
+    for (const auto& fragment : fragments) {
+        uint8_t chainLen = static_cast<uint8_t>(std::min<size_t>(255, fragment.chain.size()));
+        uint32_t payloadSize = static_cast<uint32_t>(fragment.payload.size());
+        os.write(reinterpret_cast<const char*>(&fragment.model), sizeof(fragment.model));
+        os.write(reinterpret_cast<const char*>(&chainLen), sizeof(chainLen));
+        if (chainLen > 0) {
+            os.write(fragment.chain.data(), chainLen);
+        }
+        os.write(reinterpret_cast<const char*>(&payloadSize), sizeof(payloadSize));
+        if (payloadSize > 0) {
+            os.write(fragment.payload.data(), static_cast<std::streamsize>(payloadSize));
+        }
+    }
+
+    return static_cast<bool>(os);
+}
+
+static bool readContainer(
+    const char* data, size_t size, std::string& title,
+    std::vector<ContainerFragment>& fragments
+) {
+    title.clear();
+    fragments.clear();
+    if (!hasFoldcompMagic(data, size)) {
+        return false;
+    }
+    if (size < MAGICNUMBER_LENGTH + sizeof(CompressedFileHeader) + sizeof(uint32_t)) {
+        return false;
+    }
+
+    size_t offset = MAGICNUMBER_LENGTH;
+    CompressedFileHeader header = {};
+    memcpy(&header, data + offset, sizeof(header));
+    offset += sizeof(header);
+    if (!isContainerHeader(header)) {
+        return false;
+    }
+
+    uint32_t nFragments = 0;
+    if (!readBinaryValue(data, size, offset, nFragments)) {
+        return false;
+    }
+
+    if (offset + header.lenTitle > size) {
+        return false;
+    }
+    if (header.lenTitle > 0) {
+        title.assign(data + offset, data + offset + header.lenTitle);
+        offset += header.lenTitle;
+    }
+
+    fragments.reserve(nFragments);
+    for (uint32_t i = 0; i < nFragments; i++) {
+        ContainerFragment fragment;
+        uint8_t chainLen = 0;
+        uint32_t payloadSize = 0;
+        if (!readBinaryValue(data, size, offset, fragment.model) ||
+            !readBinaryValue(data, size, offset, chainLen)) {
+            return false;
+        }
+        if (offset + chainLen > size) {
+            return false;
+        }
+        if (chainLen > 0) {
+            fragment.chain.assign(data + offset, data + offset + chainLen);
+            offset += chainLen;
+        }
+        if (!readBinaryValue(data, size, offset, payloadSize)) {
+            return false;
+        }
+        if (offset + payloadSize > size) {
+            return false;
+        }
+        fragment.payload.assign(data + offset, data + offset + payloadSize);
+        offset += payloadSize;
+        fragments.push_back(std::move(fragment));
+    }
+    return true;
+}
+
+static void writeTitleLines(const std::string& title, std::ostream& pdb_stream) {
+    if (title.empty()) {
+        return;
+    }
+    const char* headerData = title.c_str();
+    size_t headerLen = title.length();
+    int remainingHeader = static_cast<int>(headerLen);
+    char buffer[128];
+    int written = snprintf(
+        buffer, sizeof(buffer), "TITLE     %.*s\n",
+        std::min(70, remainingHeader), headerData
+    );
+    if (written >= 0 && written < static_cast<int>(sizeof(buffer))) {
+        pdb_stream << buffer;
+    }
+    remainingHeader -= 70;
+    int continuation = 2;
+    while (remainingHeader > 0) {
+        written = snprintf(
+            buffer, sizeof(buffer), "TITLE  % 3d%.*s\n",
+            continuation, std::min(70, remainingHeader),
+            headerData + (headerLen - remainingHeader)
+        );
+        if (written >= 0 && written < static_cast<int>(sizeof(buffer))) {
+            pdb_stream << buffer;
+        }
+        remainingHeader -= 70;
+        continuation++;
+    }
+}
+
+static void writeSegmentsToPDB(
+    const std::vector<DecompressedSegment>& segments,
+    const std::string& title,
+    std::ostream& pdb_stream
+) {
+    if (segments.empty()) {
+        return;
+    }
+    writeTitleLines(title, pdb_stream);
+    std::set<int> modelSet;
+    for (const auto& segment : segments) {
+        modelSet.insert(segment.model);
+    }
+    bool writeModels = modelSet.size() > 1;
+    int currModel = -1;
+    for (const auto& segment : segments) {
+        if (writeModels && segment.model != currModel) {
+            if (currModel != -1) {
+                pdb_stream << "ENDMDL\n";
+            }
+            pdb_stream << "MODEL     " << std::setw(4) << segment.model << '\n';
+            currModel = segment.model;
+        }
+        std::vector<AtomCoordinate> atoms = segment.atoms;
+        writeAtomCoordinatesToPDB(atoms, "", pdb_stream);
+    }
+    if (writeModels) {
+        pdb_stream << "ENDMDL\n";
+    }
+}
+
+static std::string makeFragmentSuffix(const ContainerFragment& fragment, size_t index) {
+    std::ostringstream oss;
+    oss << "|m" << fragment.model;
+    if (!fragment.chain.empty()) {
+        oss << "|c" << fragment.chain;
+    }
+    oss << "|f" << index;
+    return oss.str();
+}
 
 int print_usage(void) {
     std::cout << "Usage: foldcomp compress <pdb|cif> [<fcz>]" << std::endl;
@@ -466,6 +676,7 @@ int main(int argc, char* const *argv) {
 
                 removeAlternativePosition(atomCoordinates);
 
+                std::vector<ContainerFragment> encodedFragments;
                 std::vector<std::pair<size_t, size_t>> chain_indices = identifyChains(atomCoordinates);
                 // Check if there are multiple chains or regions with discontinous residue indices
                 for (size_t i = 0; i < chain_indices.size(); i++) {
@@ -486,50 +697,74 @@ int main(int argc, char* const *argv) {
                         compRes.strTitle = title;
                         compRes.anchorThreshold = anchor_residue_threshold;
                         compData = compRes.compress(frag_span);
-
-                        std::string filename;
-                        if (chain_indices.size() > 1) {
-                            std::string chain = atomCoordinates[chain_indices[i].first].chain;
-                            filename = outputFile + chain;
-                        } else {
-                            filename = outputFile;
+                        if (compData.empty()) {
+                            std::cerr << "[Warning] Skipping fragment with incomplete backbone: " << base << std::endl;
+                            continue;
                         }
-
-                        if (frag_indices.size() > 1) {
-                            filename += "_" + std::to_string(j);
-                        }
-
-                        if (!db_output) {
-                            if (isCompressible(outputParts)) {
-                                filename += ".fcz";
-                            } else {
-                                filename += "." + outputParts.second;
-                            }
-                        }
-
-                        if (db_output) {
-                            std::ostringstream oss;
-                            compRes.writeStream(oss);
-                            std::string os = oss.str();
-#pragma omp critical
-                            {
-                                writer_append(handle, os.c_str(), os.size(), key, outputFile.c_str());
-                                key++;
-                            }
-                        } else if (save_as_tar) {
-#pragma omp critical
-                            {
-                                compRes.writeTar(tar_out, baseName(filename), compRes.getSize());
-                            }
-                        } else {
-                            if (stat(filename.c_str(), &st) == 0 && !overwrite) {
-                                std::cerr << "[Error] Output file already exists: " << baseName(outputFile) << std::endl;
-                                return false;
-                            }
-                            compRes.write(filename);
-                        }
+                        std::ostringstream oss;
+                        compRes.writeStream(oss);
+                        ContainerFragment containerFragment;
+                        containerFragment.model = atomCoordinates[frag_indices[j].first].model;
+                        containerFragment.chain = atomCoordinates[frag_indices[j].first].chain;
+                        containerFragment.payload = oss.str();
+                        encodedFragments.push_back(std::move(containerFragment));
                         compData.clear();
                     }
+                }
+
+                if (encodedFragments.empty()) {
+                    std::cerr << "[Warning] No encodable fragments found in input file: " << base << std::endl;
+                    return true;
+                }
+
+                bool useContainer = encodedFragments.size() > 1;
+                std::string encoded;
+                if (useContainer) {
+                    std::ostringstream oss;
+                    if (!writeContainer(oss, title, encodedFragments)) {
+                        std::cerr << "[Error] Failed to write container payload: " << base << std::endl;
+                        return false;
+                    }
+                    encoded = oss.str();
+                } else {
+                    encoded = encodedFragments[0].payload;
+                }
+
+                std::string filename = outputFile;
+                if (!db_output) {
+                    if (isCompressible(outputParts)) {
+                        filename += ".fcz";
+                    } else {
+                        filename += "." + outputParts.second;
+                    }
+                }
+
+                if (db_output) {
+                    std::string dbKey = baseName(filename);
+                    std::replace(dbKey.begin(), dbKey.end(), '.', '_');
+#pragma omp critical
+                    {
+                        writer_append(handle, encoded.c_str(), encoded.size(), key, dbKey.c_str());
+                        key++;
+                    }
+                } else if (save_as_tar) {
+#pragma omp critical
+                    {
+                        mtar_write_file_header(&tar_out, baseName(filename).c_str(), encoded.size());
+                        mtar_write_data(&tar_out, encoded.c_str(), encoded.size());
+                    }
+                } else {
+                    if (stat(filename.c_str(), &st) == 0 && !overwrite) {
+                        std::cerr << "[Error] Output file already exists: " << baseName(outputFile) << std::endl;
+                        return false;
+                    }
+                    std::ofstream outFile(filename, std::ios::binary);
+                    if (!outFile) {
+                        std::cerr << "[Error] Failed to open output file: " << filename << std::endl;
+                        return false;
+                    }
+                    outFile.write(encoded.data(), encoded.size());
+                    outFile.close();
                 }
                 atomCoordinates.clear();
                 return true;
@@ -611,32 +846,78 @@ int main(int argc, char* const *argv) {
 
             process_entry_func func = [&](const char* name, const char* dataBuffer, size_t size) -> bool {
                 TimerGuard guard(name, measure_time);
-                Foldcomp compRes;
-                std::istringstream input(std::string(dataBuffer, size));
-                int flag = compRes.read(input);
-                if (flag != 0) {
-                    if (flag == -1) {
-                        std::cerr << "[Error] File is not a valid fcz file" << std::endl;
-                    } else if (flag == -2) {
-                        std::cerr << "[Error] Could not restore prevAtoms" << std::endl;
-                    } else {
-                        std::cerr << "[Error] Unknown read error" << std::endl;
+                std::vector<DecompressedSegment> segments;
+                std::string structureTitle;
+
+                std::string containerTitle;
+                std::vector<ContainerFragment> containerFragments;
+                bool isContainer = readContainer(dataBuffer, size, containerTitle, containerFragments);
+                if (isContainer) {
+                    structureTitle = containerTitle;
+                    for (const auto& fragment : containerFragments) {
+                        Foldcomp compRes;
+                        std::istringstream fragmentInput(fragment.payload);
+                        int flag = compRes.read(fragmentInput);
+                        if (flag != 0) {
+                            std::cerr << "[Error] Failed to read a container fragment." << std::endl;
+                            return false;
+                        }
+                        compRes.useAltAtomOrder = use_alt_order;
+                        if (check_before_decompression) {
+                            ValidityError err = compRes.checkValidity();
+                            if (err != ValidityError::SUCCESS) {
+                                printValidityError(err, compRes.strTitle);
+                                return true;
+                            }
+                        }
+                        std::vector<AtomCoordinate> atomCoordinates;
+                        flag = compRes.decompress(atomCoordinates);
+                        if (flag != 0) {
+                            std::cerr << "[Error] decompressing container fragment." << std::endl;
+                            return false;
+                        }
+                        for (auto& atom : atomCoordinates) {
+                            atom.model = fragment.model;
+                        }
+                        segments.push_back({fragment.model, std::move(atomCoordinates)});
+                        if (structureTitle.empty()) {
+                            structureTitle = compRes.strTitle;
+                        }
                     }
-                    return false;
-                }
-                std::vector<AtomCoordinate> atomCoordinates;
-                compRes.useAltAtomOrder = use_alt_order;
-                // Check validity before decompression if requested
-                if (check_before_decompression) {
-                    ValidityError err = compRes.checkValidity();
-                    if (err != ValidityError::SUCCESS) {
-                        printValidityError(err, compRes.strTitle);
-                        return true;
+                } else {
+                    Foldcomp compRes;
+                    std::istringstream input(std::string(dataBuffer, size));
+                    int flag = compRes.read(input);
+                    if (flag != 0) {
+                        if (flag == -1) {
+                            std::cerr << "[Error] File is not a valid fcz file" << std::endl;
+                        } else if (flag == -2) {
+                            std::cerr << "[Error] Could not restore prevAtoms" << std::endl;
+                        } else {
+                            std::cerr << "[Error] Unknown read error" << std::endl;
+                        }
+                        return false;
                     }
+                    compRes.useAltAtomOrder = use_alt_order;
+                    if (check_before_decompression) {
+                        ValidityError err = compRes.checkValidity();
+                        if (err != ValidityError::SUCCESS) {
+                            printValidityError(err, compRes.strTitle);
+                            return true;
+                        }
+                    }
+                    std::vector<AtomCoordinate> atomCoordinates;
+                    flag = compRes.decompress(atomCoordinates);
+                    if (flag != 0) {
+                        std::cerr << "[Error] decompressing compressed data." << std::endl;
+                        return false;
+                    }
+                    segments.push_back({1, std::move(atomCoordinates)});
+                    structureTitle = compRes.strTitle;
                 }
-                flag = compRes.decompress(atomCoordinates);
-                if (flag != 0) {
-                    std::cerr << "[Error] decompressing compressed data." << std::endl;
+
+                if (segments.empty()) {
+                    std::cerr << "[Error] No segments were decompressed." << std::endl;
                     return false;
                 }
 
@@ -653,24 +934,22 @@ int main(int argc, char* const *argv) {
                     outputFile = output + "/" + outputParts.first + "." + outputSuffix;
                 }
 
+                std::ostringstream pdbStream;
+                writeSegmentsToPDB(segments, structureTitle, pdbStream);
+                std::string pdbText = pdbStream.str();
+
                 if (db_output) {
-                    std::ostringstream oss;
-                    writeAtomCoordinatesToPDB(atomCoordinates, compRes.strTitle, oss);
-                    oss << '\0';
-                    std::string os = oss.str();
+                    pdbText.push_back('\0');
 #pragma omp critical
                     {
-                        writer_append(handle, os.c_str(), os.size(), key, outputFile.c_str());
+                        writer_append(handle, pdbText.c_str(), pdbText.size(), key, outputFile.c_str());
                         key++;
                     }
                 } else if (save_as_tar) {
-                    std::ostringstream oss;
-                    writeAtomCoordinatesToPDB(atomCoordinates, compRes.strTitle, oss);
 #pragma omp critical
                     {
-                        std::string os = oss.str();
-                        mtar_write_file_header(&tar_out, outputFile.c_str(), os.size());
-                        mtar_write_data(&tar_out, os.c_str(), os.size());
+                        mtar_write_file_header(&tar_out, outputFile.c_str(), pdbText.size());
+                        mtar_write_data(&tar_out, pdbText.c_str(), pdbText.size());
                     }
                 } else {
                     // Write decompressed data to file
@@ -679,11 +958,12 @@ int main(int argc, char* const *argv) {
                         std::cerr << "[Error] Output file already exists: " << baseName(outputFile) << std::endl;
                         return false;
                     }
-                    flag = writeAtomCoordinatesToPDBFile(atomCoordinates, compRes.strTitle, outputFile);
-                    if (flag != 0) {
+                    std::ofstream out(outputFile, std::ios::binary);
+                    if (!out) {
                         std::cerr << "[Error] Writing decompressed data to file: " << output << std::endl;
                         return false;
                     }
+                    out.write(pdbText.data(), pdbText.size());
                 }
                 return true;
             };
@@ -776,23 +1056,108 @@ int main(int argc, char* const *argv) {
             }
 
             process_entry_func func = [&](const char* name, const char* dataBuffer, size_t size) -> bool {
-                std::istringstream input(std::string(dataBuffer, size));
-                Foldcomp compRes;
-                int flag = compRes.read(input);
                 std::string strName(name);
-                compRes.strTitle = ext_use_title ? compRes.strTitle : strName;
-                if (flag != 0) {
-                    if (flag == -1) {
-                        std::cerr << "[Error] File is not a valid fcz file" << std::endl;
-                    } else if (flag == -2) {
-                        std::cerr << "[Error] Could not restore prevAtoms" << std::endl;
-                    } else {
-                        std::cerr << "[Error] Unknown read error" << std::endl;
+                std::vector<ContainerFragment> containerFragments;
+                std::string containerTitle;
+                bool isContainer = readContainer(dataBuffer, size, containerTitle, containerFragments);
+
+                std::ostringstream extractedStream;
+                if (!isContainer) {
+                    std::string outputTitle = strName;
+                    std::string extractedData;
+                    int totalResidue = 0;
+                    std::istringstream input(std::string(dataBuffer, size));
+                    Foldcomp compRes;
+                    int flag = compRes.read(input);
+                    if (flag != 0) {
+                        if (flag == -1) {
+                            std::cerr << "[Error] File is not a valid fcz file" << std::endl;
+                        } else if (flag == -2) {
+                            std::cerr << "[Error] Could not restore prevAtoms" << std::endl;
+                        } else {
+                            std::cerr << "[Error] Unknown read error" << std::endl;
+                        }
+                        return false;
                     }
-                    return false;
+                    if (ext_use_title && !compRes.strTitle.empty()) {
+                        outputTitle = compRes.strTitle;
+                    }
+                    compRes.extract(extractedData, ext_mode, ext_plddt_digits);
+                    totalResidue = compRes.nResidue;
+
+                    if (ext_mode == 0 && ext_plddt_digits > 1) {
+                        extractedStream << outputTitle << "\t" << totalResidue << "\t" << extractedData << "\n";
+                    } else {
+                        extractedStream << ">" << outputTitle << "\n" << extractedData << "\n";
+                    }
+                } else {
+                    struct ExtractGroup {
+                        int16_t model = 1;
+                        std::string chain;
+                        int totalResidue = 0;
+                        std::string data;
+                    };
+                    std::vector<ExtractGroup> groups;
+                    std::string baseTitle = ext_use_title ? containerTitle : strName;
+
+                    for (size_t fragmentIndex = 0; fragmentIndex < containerFragments.size(); fragmentIndex++) {
+                        Foldcomp compRes;
+                        std::istringstream fragmentInput(containerFragments[fragmentIndex].payload);
+                        int flag = compRes.read(fragmentInput);
+                        if (flag != 0) {
+                            std::cerr << "[Error] Failed to read a container fragment during extraction." << std::endl;
+                            return false;
+                        }
+                        if (baseTitle.empty() && ext_use_title && !compRes.strTitle.empty()) {
+                            baseTitle = compRes.strTitle;
+                        }
+
+                        size_t groupIdx = groups.size();
+                        for (size_t i = 0; i < groups.size(); i++) {
+                            if (groups[i].model == containerFragments[fragmentIndex].model &&
+                                groups[i].chain == containerFragments[fragmentIndex].chain) {
+                                groupIdx = i;
+                                break;
+                            }
+                        }
+                        if (groupIdx == groups.size()) {
+                            ExtractGroup g;
+                            g.model = containerFragments[fragmentIndex].model;
+                            g.chain = containerFragments[fragmentIndex].chain;
+                            groups.push_back(std::move(g));
+                        }
+
+                        std::string fragmentData;
+                        compRes.extract(fragmentData, ext_mode, ext_plddt_digits);
+                        if (ext_mode == 0 && ext_plddt_digits > 1 && !groups[groupIdx].data.empty()) {
+                            groups[groupIdx].data.push_back(',');
+                        }
+                        groups[groupIdx].data += fragmentData;
+                        groups[groupIdx].totalResidue += compRes.nResidue;
+                    }
+
+                    if (baseTitle.empty()) {
+                        baseTitle = strName;
+                    }
+                    bool annotateGroup = groups.size() > 1;
+                    for (const auto& group : groups) {
+                        std::string groupTitle = baseTitle;
+                        if (annotateGroup) {
+                            std::ostringstream suffix;
+                            suffix << "|m" << group.model;
+                            if (!group.chain.empty()) {
+                                suffix << "|c" << group.chain;
+                            }
+                            groupTitle += suffix.str();
+                        }
+                        if (ext_mode == 0 && ext_plddt_digits > 1) {
+                            extractedStream << groupTitle << "\t" << group.totalResidue << "\t" << group.data << "\n";
+                        } else {
+                            extractedStream << ">" << groupTitle << "\n" << group.data << "\n";
+                        }
+                    }
                 }
-                std::string data;
-                compRes.extract(data, ext_mode, ext_plddt_digits);
+                std::string extractedText = extractedStream.str();
                 std::string base = baseName(name);
                 std::pair<std::string, std::string> outputParts = getFileParts(base);
                 std::string outputFile;
@@ -809,38 +1174,20 @@ int main(int argc, char* const *argv) {
                 if (isMergedOutput) {
 #pragma omp critical
                     {
-                        if (ext_mode == 0 && ext_plddt_digits > 1) {
-                            compRes.writeTSV(default_out, data);
-                        } else {
-                            compRes.writeFASTALike(default_out, data);
-                        }
+                        default_out << extractedText;
                     }
                 } else if (db_output) {
-                    std::ostringstream oss;
-                    if (ext_mode == 0 && ext_plddt_digits > 1) {
-                        compRes.writeTSV(oss, data);
-                    } else {
-                        compRes.writeFASTALike(oss, data);
-                    }
-                    oss << '\0';
-                    std::string os = oss.str();
+                    extractedText.push_back('\0');
 #pragma omp critical
                     {
-                        writer_append(handle, os.c_str(), os.size(), key, outputFile.c_str());
+                        writer_append(handle, extractedText.c_str(), extractedText.size(), key, outputFile.c_str());
                         key++;
                     }
                 } else if (save_as_tar) {
-                    std::ostringstream oss;
-                    if (ext_mode == 0 && ext_plddt_digits > 1) {
-                        compRes.writeTSV(oss, data);
-                    } else {
-                        compRes.writeFASTALike(oss, data);
-                    }
 #pragma omp critical
                     {
-                        std::string os = oss.str();
-                        mtar_write_file_header(&tar_out, outputFile.c_str(), os.size());
-                        mtar_write_data(&tar_out, os.c_str(), os.size());
+                        mtar_write_file_header(&tar_out, outputFile.c_str(), extractedText.size());
+                        mtar_write_data(&tar_out, extractedText.c_str(), extractedText.size());
                     }
                 } else {
                     std::ofstream output(outputFile);
@@ -848,11 +1195,7 @@ int main(int argc, char* const *argv) {
                         std::cerr << "[Error] Could not open file " << outputFile << std::endl;
                         return false;
                     }
-                    if (ext_mode == 0 && ext_plddt_digits > 1) {
-                        compRes.writeTSV(output, data);
-                    } else {
-                        compRes.writeFASTALike(output, data);
-                    }
+                    output << extractedText;
                 }
 
                 return true;
@@ -908,23 +1251,43 @@ int main(int argc, char* const *argv) {
             }
 
             process_entry_func func = [&](const char* name, const char* dataBuffer, size_t size) -> bool {
-                std::istringstream input(std::string(dataBuffer, size));
-                Foldcomp compRes;
-                int flag = compRes.read(input);
-                if (flag != 0) {
-                    if (flag == -1) {
-                        std::cerr << "[Error] File is not a valid fcz file" << std::endl;
-                    } else if (flag == -2) {
-                        std::cerr << "[Error] Could not restore prevAtoms" << std::endl;
-                    } else {
-                        std::cerr << "[Error] Unknown read error" << std::endl;
+                std::vector<ContainerFragment> containerFragments;
+                std::string containerTitle;
+                bool isContainer = readContainer(dataBuffer, size, containerTitle, containerFragments);
+                if (isContainer) {
+                    for (size_t fragmentIndex = 0; fragmentIndex < containerFragments.size(); fragmentIndex++) {
+                        Foldcomp compRes;
+                        std::istringstream fragmentInput(containerFragments[fragmentIndex].payload);
+                        int flag = compRes.read(fragmentInput);
+                        if (flag != 0) {
+                            std::cerr << "[Error] Failed to read a container fragment during check." << std::endl;
+                            return false;
+                        }
+                        ValidityError err = compRes.checkValidity();
+                        std::string sname(name);
+                        sname += makeFragmentSuffix(containerFragments[fragmentIndex], fragmentIndex);
+                        printValidityError(err, sname);
                     }
-                    return false;
+                    return true;
+                } else {
+                    std::istringstream input(std::string(dataBuffer, size));
+                    Foldcomp compRes;
+                    int flag = compRes.read(input);
+                    if (flag != 0) {
+                        if (flag == -1) {
+                            std::cerr << "[Error] File is not a valid fcz file" << std::endl;
+                        } else if (flag == -2) {
+                            std::cerr << "[Error] Could not restore prevAtoms" << std::endl;
+                        } else {
+                            std::cerr << "[Error] Unknown read error" << std::endl;
+                        }
+                        return false;
+                    }
+                    ValidityError err = compRes.checkValidity();
+                    std::string sname(name);
+                    printValidityError(err, sname);
+                    return true;
                 }
-                ValidityError err = compRes.checkValidity();
-                std::string sname(name);
-                printValidityError(err, sname);
-                return true;
             };
             processor->run(func, num_threads);
             delete processor;

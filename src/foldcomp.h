@@ -86,7 +86,7 @@ static_assert(sizeof(BackboneChain) == 8, "BackboneChain must remain compatible"
 struct BackboneChainHeader {
     uint16_t nResidue;   // 16 bits
     uint16_t nAtom;      // 16 bits
-    uint16_t idxResidue; // 16 bits
+    int16_t idxResidue; // 16 bits
     uint16_t idxAtom;    // 16 bits
     // char firstResidue; // 1 byte = 8 bits --> WILL BE APPLIED AFTER CHANGING BACKBONE CHAIN
     float prevAtoms[9];  // 9 * 4 byte
@@ -119,11 +119,13 @@ struct CompressedFileHeader {
     // Backbone
     uint16_t nResidue;   // 16 bits
     uint16_t nAtom;      // 16 bits
-    uint16_t idxResidue; // 16 bits
+    int16_t idxResidue;  // 16 bits
     uint16_t idxAtom;    // 16 bits
     // Anchor points
     uint8_t nAnchor;     // 8 bits
     char chain;          // 8 bits + 8 bits padding TODO
+    uint8_t version;     // 8 bits (uses previous padding)
+    uint8_t flags;       // 8 bits (uses previous padding)
     // Sidechain
     uint32_t nSideChainTorsion; // 32 bits
     char firstResidue;   // 8 bits
@@ -274,7 +276,7 @@ private:
 
     // Anchor
     int _getAnchorNum(int threshold);
-    void _setAnchor(const tcb::span<AtomCoordinate>& atomCoordinates);
+    void _setAnchor();
     std::vector<AtomCoordinate> _getAnchorAtoms(bool includeStartAndEnd = true);
 
     int _discretizeSideChainTorsionAngles(
