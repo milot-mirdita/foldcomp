@@ -71,7 +71,6 @@ static int overwrite = 0;
 static constexpr uint8_t FOLDCOMP_FORMAT_VERSION_CONTAINER = 2;
 static constexpr uint8_t FOLDCOMP_FORMAT_FLAG_CONTAINER = 1;
 static constexpr uint8_t CONTAINER_FRAGMENT_KIND_FCZ = 0;
-static constexpr uint8_t CONTAINER_FRAGMENT_KIND_RAW_PDB = 1;
 static constexpr uint8_t CONTAINER_FRAGMENT_KIND_RAW_ATOMS = 2;
 
 struct ContainerFragment {
@@ -1062,20 +1061,13 @@ int main(int argc, char* const *argv) {
                     structureTitle = containerTitle;
                     for (const auto& fragment : containerFragments) {
                         std::vector<AtomCoordinate> atomCoordinates;
-                        if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_PDB) {
-                            StructureReader reader;
-                            if (!reader.loadFromBuffer(fragment.payload.data(), fragment.payload.size(), "fragment.pdb")) {
-                                std::cerr << "[Error] Failed to read a raw container fragment." << std::endl;
-                                return false;
-                            }
-                            reader.readAllAtoms(atomCoordinates);
-                        } else if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_ATOMS) {
+                        if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_ATOMS) {
                             if (!deserializeAtomCoordinates(
                                     fragment.payload.data(), fragment.payload.size(), atomCoordinates)) {
                                 std::cerr << "[Error] Failed to decode a raw atom fragment." << std::endl;
                                 return false;
                             }
-                        } else {
+                        } else if (fragment.kind == CONTAINER_FRAGMENT_KIND_FCZ) {
                             Foldcomp compRes;
                             std::istringstream fragmentInput(fragment.payload);
                             int flag = compRes.read(fragmentInput);
@@ -1099,6 +1091,10 @@ int main(int argc, char* const *argv) {
                             if (structureTitle.empty()) {
                                 structureTitle = compRes.strTitle;
                             }
+                        } else {
+                            std::cerr << "[Error] Unsupported container fragment kind: "
+                                      << static_cast<int>(fragment.kind) << std::endl;
+                            return false;
                         }
                         for (auto& atom : atomCoordinates) {
                             atom.model = fragment.model;
@@ -1478,8 +1474,13 @@ int main(int argc, char* const *argv) {
                 bool isContainer = readContainer(dataBuffer, size, containerTitle, containerFragments);
                 if (isContainer) {
                     for (size_t fragmentIndex = 0; fragmentIndex < containerFragments.size(); fragmentIndex++) {
-                        if (containerFragments[fragmentIndex].kind == CONTAINER_FRAGMENT_KIND_RAW_PDB) {
+                        if (containerFragments[fragmentIndex].kind == CONTAINER_FRAGMENT_KIND_RAW_ATOMS) {
                             continue;
+                        }
+                        if (containerFragments[fragmentIndex].kind != CONTAINER_FRAGMENT_KIND_FCZ) {
+                            std::cerr << "[Error] Unsupported container fragment kind during check: "
+                                      << static_cast<int>(containerFragments[fragmentIndex].kind) << std::endl;
+                            return false;
                         }
                         Foldcomp compRes;
                         std::istringstream fragmentInput(containerFragments[fragmentIndex].payload);

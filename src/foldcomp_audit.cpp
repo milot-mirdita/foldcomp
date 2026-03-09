@@ -39,7 +39,6 @@ std::map<ResidueKey, ResidueStats> groupResidues(const std::vector<AtomCoordinat
 static constexpr uint8_t FOLDCOMP_FORMAT_VERSION_CONTAINER = 2;
 static constexpr uint8_t FOLDCOMP_FORMAT_FLAG_CONTAINER = 1;
 static constexpr uint8_t CONTAINER_FRAGMENT_KIND_FCZ = 0;
-static constexpr uint8_t CONTAINER_FRAGMENT_KIND_RAW_PDB = 1;
 static constexpr uint8_t CONTAINER_FRAGMENT_KIND_RAW_ATOMS = 2;
 
 struct ContainerFragment {
@@ -181,18 +180,12 @@ bool decodeEntryToAtoms(const char* dataBuffer, size_t size, std::vector<AtomCoo
     if (isContainer) {
         for (const auto& fragment : containerFragments) {
             std::vector<AtomCoordinate> fragmentAtoms;
-            if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_PDB) {
-                StructureReader reader;
-                if (!reader.loadFromBuffer(fragment.payload.data(), fragment.payload.size(), "fragment.pdb")) {
-                    return false;
-                }
-                reader.readAllAtoms(fragmentAtoms);
-            } else if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_ATOMS) {
+            if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_ATOMS) {
                 if (!deserializeAtomCoordinates(
                         fragment.payload.data(), fragment.payload.size(), fragmentAtoms)) {
                     return false;
                 }
-            } else {
+            } else if (fragment.kind == CONTAINER_FRAGMENT_KIND_FCZ) {
                 Foldcomp compRes;
                 std::istringstream fragmentInput(fragment.payload);
                 int flag = compRes.read(fragmentInput);
@@ -203,6 +196,8 @@ bool decodeEntryToAtoms(const char* dataBuffer, size_t size, std::vector<AtomCoo
                 if (flag != 0) {
                     return false;
                 }
+            } else {
+                return false;
             }
             for (auto& atom : fragmentAtoms) {
                 atom.model = fragment.model;
@@ -834,8 +829,8 @@ int commandContainerReport(const std::string& encodedPath) {
             std::cout << "\n";
             continue;
         }
-        if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_PDB) {
-            std::cout << " raw_pdb=1\n";
+        if (fragment.kind != CONTAINER_FRAGMENT_KIND_FCZ) {
+            std::cout << " unsupported_kind=" << static_cast<int>(fragment.kind) << "\n";
             continue;
         }
 
