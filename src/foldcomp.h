@@ -129,13 +129,18 @@ struct CompressedFileHeader {
     // Sidechain
     uint32_t nSideChainTorsion; // 32 bits
     char firstResidue;   // 8 bits
-    char lastResidue;    // 8 bits + 8 bits padding TODO
+    char lastResidue;    // 8 bits
+    char chain2;         // 8 bits
+    char chain3;         // 8 bits
     uint32_t lenTitle;   // 32 bits
     // Discretizer for backbone chain
     float mins[6];       // 6 * 32 bits
     float cont_fs[6];    // 6 * 32 bits
 };
 static_assert(sizeof(CompressedFileHeader) == 72, "CompressedFileHeader must remain compatible");
+
+std::string getChainName(const CompressedFileHeader& header);
+void setChainName(CompressedFileHeader& header, const std::string& chain);
 
 struct SideChainDiscretizers {
     float ala_min[2];

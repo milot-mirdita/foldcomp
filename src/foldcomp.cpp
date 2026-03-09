@@ -157,6 +157,26 @@ float _continuize(unsigned int input, float min, float cont_f) {
     return output;
 }
 
+std::string getChainName(const CompressedFileHeader& header) {
+    std::string chain;
+    if (header.chain != '\0') {
+        chain.push_back(header.chain);
+    }
+    if (header.chain2 != '\0') {
+        chain.push_back(header.chain2);
+    }
+    if (header.chain3 != '\0') {
+        chain.push_back(header.chain3);
+    }
+    return chain;
+}
+
+void setChainName(CompressedFileHeader& header, const std::string& chain) {
+    header.chain = chain.empty() ? '\0' : chain[0];
+    header.chain2 = chain.size() > 1 ? chain[1] : '\0';
+    header.chain3 = chain.size() > 2 ? chain[2] : '\0';
+}
+
 /**
  * @brief Reconstruct backbone atoms from compressed backbone info
  *
@@ -773,7 +793,7 @@ int Foldcomp::_restoreAtomCoordinate(float* coords) {
     // IMPORTANT: WARNING: TODO: Atom indexing is not correct right now
     // SIDE CHAIN ATOMS SHOULD GE CONSIDERED WHEN INDEXING
     // convert char to string
-    std::string chain = std::string(1, this->header.chain);
+    std::string chain = getChainName(this->header);
     AtomCoordinate prevN = AtomCoordinate(
         "N", firstResidue, chain, this->header.idxAtom, this->header.idxResidue,
         coords[0], coords[1], coords[2]
@@ -926,7 +946,6 @@ int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
         success = reconstructBackboneReverse(
             atomByAnchor, this->anchorCoordinates[i], subTorsionAngles, this->nerf
         );
-        // Append atomByAnchor to atom
         if (i != this->nAllAnchor - 2) {
             atom.insert(atom.end(), atomByAnchor.begin(), atomByAnchor.end() - 3);
         } else {
@@ -1044,9 +1063,11 @@ int Foldcomp::read(std::istream & file) {
     float oxtCoords[3];
     file.read(reinterpret_cast<char*>(oxtCoords), sizeof(oxtCoords));
     this->OXT_coords = { oxtCoords[0], oxtCoords[1], oxtCoords[2] };
+    int lastResidueIndex = static_cast<int>(this->header.idxResidue + this->header.nResidue - 1);
+    int lastAtomIndex = static_cast<int>(this->header.idxAtom + this->header.nAtom - 1);
     this->OXT = AtomCoordinate(
-        "OXT", getThreeLetterCode(this->header.lastResidue), std::string(1, this->header.chain),
-        (int)this->header.nAtom, (int)this->header.nResidue, this->OXT_coords
+        "OXT", getThreeLetterCode(this->header.lastResidue), getChainName(this->header),
+        lastAtomIndex, lastResidueIndex, this->OXT_coords
     );
 
     // Read sidechain discretizers
@@ -1452,7 +1473,13 @@ CompressedFileHeader Foldcomp::get_header() {
     header.firstResidue = this->firstResidue;
     header.lastResidue = this->lastResidue;
     header.lenTitle = this->lenTitle;
-    header.chain = this->chain;
+    std::string chainName;
+    if (!this->backbone.empty()) {
+        chainName = this->backbone[0].chain;
+    } else if (this->chain != '\0') {
+        chainName.assign(1, this->chain);
+    }
+    setChainName(header, chainName);
     // discretizer parameters
     header.mins[0] = this->phiDisc.min;
     header.mins[1] = this->psiDisc.min;

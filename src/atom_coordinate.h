@@ -117,3 +117,23 @@ void ftoa(float n, char* s);
 
 std::vector<std::pair<size_t, size_t>> identifyChains(const std::vector<AtomCoordinate>& atoms);
 std::vector<std::pair<size_t, size_t>> identifyDiscontinousResInd(const std::vector<AtomCoordinate>& atoms, size_t chain_start, size_t chain_end);
+std::vector<std::pair<size_t, size_t>> identifyCompleteBackboneRegions(const tcb::span<AtomCoordinate>& atoms);
+
+struct BackboneRegion {
+    size_t start;
+    size_t end;
+    bool encodable;
+};
+
+std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordinate>& atoms);
+
+bool serializeAtomCoordinates(
+    const std::vector<AtomCoordinate>& atoms,
+    std::string& output
+);
+
+bool deserializeAtomCoordinates(
+    const char* data,
+    size_t size,
+    std::vector<AtomCoordinate>& atoms
+);

@@ -18,6 +18,27 @@
 #include <iostream>
 #include <sstream> // IWYU pragma: keep
 
+namespace {
+
+bool startsNewResidue(const AtomCoordinate& current, const AtomCoordinate& previous) {
+    if (current.chain != previous.chain) {
+        return true;
+    }
+    if (current.model != previous.model) {
+        return true;
+    }
+    if (current.residue_index != previous.residue_index) {
+        return true;
+    }
+    if (current.atom == "N" && previous.atom != "N") {
+        // Reused residue indices can still denote a new residue in author numbering.
+        return true;
+    }
+    return false;
+}
+
+}
+
 /**
  * @brief Construct a new Atom Coordinate:: Atom Coordinate object
  *
@@ -274,7 +295,8 @@ void writeAtomCoordinatesToPDB(
         pdb_stream << " "; // 17
         pdb_stream << std::setw(3) << std::right << atoms[i].residue; // 18-20
         pdb_stream << " "; // 21
-        pdb_stream << atoms[i].chain; // 22
+        char chainId = atoms[i].chain.empty() ? ' ' : atoms[i].chain[0];
+        pdb_stream << chainId; // 22
         pdb_stream << std::setw(4) << atoms[i].residue_index; // 23-26
         pdb_stream << "    "; // 27-30
         char buffer[16];
@@ -300,7 +322,7 @@ void writeAtomCoordinatesToPDB(
             // 23-26 Residue sequence number.
             pdb_stream << "TER   " << std::setw(5) << atoms[i].atom_index + 1 << "      ";
             pdb_stream << std::setw(3) << std::right << atoms[i].residue;
-            pdb_stream << " " << atoms[i].chain;
+            pdb_stream << " " << chainId;
             pdb_stream << std::setw(4) << atoms[i].residue_index << std::endl;
         }
     }
@@ -332,19 +354,7 @@ std::vector< std::vector<AtomCoordinate> > splitAtomByResidue(
             continue;
         }
 
-        bool newResidue = false;
-        if (atomCoordinates[i].chain != atomCoordinates[i - 1].chain) {
-            newResidue = true;
-        } else if (atomCoordinates[i].model != atomCoordinates[i - 1].model) {
-            newResidue = true;
-        } else if (atomCoordinates[i].residue_index != atomCoordinates[i - 1].residue_index) {
-            newResidue = true;
-        } else if (atomCoordinates[i].atom == "N" && atomCoordinates[i - 1].atom != "N") {
-            // Handle insertion-code-like cases where residue index is reused.
-            newResidue = true;
-        }
-
-        if (newResidue) {
+        if (startsNewResidue(atomCoordinates[i], atomCoordinates[i - 1])) {
             output.push_back(currentResidue);
             currentResidue.clear();
         }
@@ -500,41 +510,16 @@ std::vector< std::pair<size_t, size_t> > identifyChains(const std::vector<AtomCo
         return output;
     }
     size_t start = 0;
-    // Split by chain
     for (size_t i = 1; i < atoms.size(); i++) {
         if (atoms[i].model != atoms[i - 1].model || atoms[i].chain != atoms[i - 1].chain) {
-            // Ensure that the new fragment starts with "N"
-            if (atoms[i].atom == "N") {
-                output.emplace_back(start, i);
-                start = i;
-            } else {
-                // Find the first "N" atom
-                bool found = false;
-                for (size_t j = i; j < atoms.size(); j++) {
-                    if (atoms[j].atom == "N") {
-                        // Ignore fragment between i and j
-                        output.emplace_back(start, i);
-                        start = j;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    output.emplace_back(start, i);
-                    start = atoms.size();
-                    break;
-                }
-                // Continue from new chain start in next iteration.
-                i = start;
-            }
+            output.emplace_back(start, i);
+            start = i;
         }
     }
-    // Add the last fragment
     if (start < atoms.size()) {
         output.emplace_back(start, atoms.size());
     }
     return output;
-
 }
 
 /**
@@ -552,25 +537,232 @@ std::vector<std::pair<size_t, size_t>> identifyDiscontinousResInd(
     if (chain_start >= chain_end || chain_end > atoms.size()) {
         return output;
     }
-    // Extract N atoms only within chain
-    std::vector<std::pair<size_t, int>> N_indices;
-    for (size_t i = chain_start; i < chain_end; i++) {
-        if (atoms[i].atom == "N") {
-            N_indices.emplace_back(i, atoms[i].residue_index);
+    size_t start = chain_start;
+    int previousResidueIndex = atoms[chain_start].residue_index;
+
+    for (size_t i = chain_start + 1; i < chain_end; i++) {
+        if (!startsNewResidue(atoms[i], atoms[i - 1])) {
+            continue;
         }
-    }
-    if (N_indices.empty()) {
-        return output;
-    }
-    // Identify discontinuous regions
-    size_t start = N_indices[0].first;
-    for (size_t i = 1; i < N_indices.size(); i++) {
-        if (N_indices[i].second - N_indices[i - 1].second > 1) {
-            output.emplace_back(start, N_indices[i].first);
-            start = N_indices[i].first;
+
+        int currentResidueIndex = atoms[i].residue_index;
+        if (currentResidueIndex != previousResidueIndex + 1) {
+            output.emplace_back(start, i);
+            start = i;
         }
+        previousResidueIndex = currentResidueIndex;
     }
-    // Add the last fragment
     output.emplace_back(start, chain_end);
     return output;
+}
+
+std::vector<std::pair<size_t, size_t>> identifyCompleteBackboneRegions(
+    const tcb::span<AtomCoordinate>& atoms
+) {
+    std::vector<std::pair<size_t, size_t>> output;
+    if (atoms.empty()) {
+        return output;
+    }
+
+    size_t residueStart = 0;
+    size_t runStart = atoms.size();
+    size_t completeResiduesInRun = 0;
+
+    auto flushRun = [&](size_t residueEnd) {
+        if (runStart < atoms.size() && completeResiduesInRun >= 2) {
+            output.emplace_back(runStart, residueEnd);
+        }
+        runStart = atoms.size();
+        completeResiduesInRun = 0;
+    };
+
+    for (size_t i = 1; i <= atoms.size(); i++) {
+        bool endOfResidue = (i == atoms.size()) || startsNewResidue(atoms[i], atoms[i - 1]);
+        if (!endOfResidue) {
+            continue;
+        }
+
+        bool hasN = false;
+        bool hasCA = false;
+        bool hasC = false;
+        for (size_t j = residueStart; j < i; j++) {
+            if (atoms[j].atom == "N") {
+                hasN = true;
+            } else if (atoms[j].atom == "CA") {
+                hasCA = true;
+            } else if (atoms[j].atom == "C") {
+                hasC = true;
+            }
+        }
+
+        if (hasN && hasCA && hasC) {
+            if (runStart == atoms.size()) {
+                runStart = residueStart;
+            }
+            completeResiduesInRun++;
+        } else {
+            flushRun(residueStart);
+        }
+        residueStart = i;
+    }
+
+    flushRun(atoms.size());
+    return output;
+}
+
+std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordinate>& atoms) {
+    std::vector<BackboneRegion> output;
+    if (atoms.empty()) {
+        return output;
+    }
+
+    struct ResidueRegion {
+        size_t start;
+        size_t end;
+        bool completeBackbone;
+    };
+
+    std::vector<ResidueRegion> residues;
+    size_t residueStart = 0;
+    for (size_t i = 1; i <= atoms.size(); i++) {
+        bool endOfResidue = (i == atoms.size()) || startsNewResidue(atoms[i], atoms[i - 1]);
+        if (!endOfResidue) {
+            continue;
+        }
+
+        bool hasN = false;
+        bool hasCA = false;
+        bool hasC = false;
+        for (size_t j = residueStart; j < i; j++) {
+            if (atoms[j].atom == "N") {
+                hasN = true;
+            } else if (atoms[j].atom == "CA") {
+                hasCA = true;
+            } else if (atoms[j].atom == "C") {
+                hasC = true;
+            }
+        }
+        residues.push_back({residueStart, i, hasN && hasCA && hasC});
+        residueStart = i;
+    }
+
+    size_t i = 0;
+    while (i < residues.size()) {
+        if (!residues[i].completeBackbone) {
+            size_t start = residues[i].start;
+            size_t end = residues[i].end;
+            i++;
+            while (i < residues.size() && !residues[i].completeBackbone) {
+                end = residues[i].end;
+                i++;
+            }
+            output.push_back({start, end, false});
+            continue;
+        }
+
+        size_t runStartIndex = i;
+        size_t start = residues[i].start;
+        size_t end = residues[i].end;
+        i++;
+        while (i < residues.size() && residues[i].completeBackbone) {
+            end = residues[i].end;
+            i++;
+        }
+        if (i - runStartIndex >= 2) {
+            output.push_back({start, end, true});
+        } else {
+            output.push_back({start, end, false});
+        }
+    }
+
+    return output;
+}
+
+namespace {
+
+template <typename T>
+void appendBinaryValue(std::string& output, const T& value) {
+    size_t offset = output.size();
+    output.resize(offset + sizeof(T));
+    memcpy(&output[offset], &value, sizeof(T));
+}
+
+template <typename T>
+bool readBinaryValue(const char* data, size_t size, size_t& offset, T& out) {
+    if (offset + sizeof(T) > size) {
+        return false;
+    }
+    memcpy(&out, data + offset, sizeof(T));
+    offset += sizeof(T);
+    return true;
+}
+
+} // namespace
+
+bool serializeAtomCoordinates(
+    const std::vector<AtomCoordinate>& atoms,
+    std::string& output
+) {
+    output.clear();
+    uint32_t atomCount = static_cast<uint32_t>(atoms.size());
+    appendBinaryValue(output, atomCount);
+    for (const auto& atom : atoms) {
+        if (atom.atom.size() > 255 || atom.residue.size() > 255) {
+            return false;
+        }
+        uint8_t atomNameLen = static_cast<uint8_t>(atom.atom.size());
+        uint8_t residueNameLen = static_cast<uint8_t>(atom.residue.size());
+        appendBinaryValue(output, atomNameLen);
+        appendBinaryValue(output, residueNameLen);
+        appendBinaryValue(output, atom.atom_index);
+        appendBinaryValue(output, atom.residue_index);
+        appendBinaryValue(output, atom.coordinate.x);
+        appendBinaryValue(output, atom.coordinate.y);
+        appendBinaryValue(output, atom.coordinate.z);
+        appendBinaryValue(output, atom.occupancy);
+        appendBinaryValue(output, atom.tempFactor);
+        output.append(atom.atom);
+        output.append(atom.residue);
+    }
+    return true;
+}
+
+bool deserializeAtomCoordinates(
+    const char* data,
+    size_t size,
+    std::vector<AtomCoordinate>& atoms
+) {
+    atoms.clear();
+    size_t offset = 0;
+    uint32_t atomCount = 0;
+    if (!readBinaryValue(data, size, offset, atomCount)) {
+        return false;
+    }
+    atoms.reserve(atomCount);
+    for (uint32_t i = 0; i < atomCount; i++) {
+        uint8_t atomNameLen = 0;
+        uint8_t residueNameLen = 0;
+        AtomCoordinate atom;
+        if (!readBinaryValue(data, size, offset, atomNameLen) ||
+            !readBinaryValue(data, size, offset, residueNameLen) ||
+            !readBinaryValue(data, size, offset, atom.atom_index) ||
+            !readBinaryValue(data, size, offset, atom.residue_index) ||
+            !readBinaryValue(data, size, offset, atom.coordinate.x) ||
+            !readBinaryValue(data, size, offset, atom.coordinate.y) ||
+            !readBinaryValue(data, size, offset, atom.coordinate.z) ||
+            !readBinaryValue(data, size, offset, atom.occupancy) ||
+            !readBinaryValue(data, size, offset, atom.tempFactor)) {
+            return false;
+        }
+        size_t required = static_cast<size_t>(atomNameLen) + static_cast<size_t>(residueNameLen);
+        if (offset + required > size) {
+            return false;
+        }
+        atom.atom.assign(data + offset, data + offset + atomNameLen);
+        offset += atomNameLen;
+        atom.residue.assign(data + offset, data + offset + residueNameLen);
+        offset += residueNameLen;
+        atoms.push_back(std::move(atom));
+    }
+    return offset == size;
 }

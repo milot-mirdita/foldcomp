@@ -19,6 +19,7 @@
  * Copyright © 2021 Hyunbin Kim, All rights reserved
  */
 // Headers in the project
+#include "amino_acid.h"
 #include "atom_coordinate.h"
 #include "foldcomp.h"
 #include "structure_reader.h"
@@ -44,7 +45,9 @@
 #include <iostream>
 #include <sstream> // IWYU pragma: keep
 #include <set>
+#include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <sys/stat.h>
@@ -65,10 +68,14 @@ static int overwrite = 0;
 
 // version
 #define FOLDCOMP_VERSION "1.0.0"
-static constexpr uint8_t FOLDCOMP_FORMAT_VERSION_CONTAINER = 1;
+static constexpr uint8_t FOLDCOMP_FORMAT_VERSION_CONTAINER = 2;
 static constexpr uint8_t FOLDCOMP_FORMAT_FLAG_CONTAINER = 1;
+static constexpr uint8_t CONTAINER_FRAGMENT_KIND_FCZ = 0;
+static constexpr uint8_t CONTAINER_FRAGMENT_KIND_RAW_PDB = 1;
+static constexpr uint8_t CONTAINER_FRAGMENT_KIND_RAW_ATOMS = 2;
 
 struct ContainerFragment {
+    uint8_t kind = CONTAINER_FRAGMENT_KIND_FCZ;
     int16_t model = 1;
     std::string chain;
     std::string payload;
@@ -97,7 +104,8 @@ static bool hasFoldcompMagic(const char* data, size_t size) {
 }
 
 static bool isContainerHeader(const CompressedFileHeader& header) {
-    return header.version == FOLDCOMP_FORMAT_VERSION_CONTAINER &&
+    bool supportedVersion = header.version == 1 || header.version == FOLDCOMP_FORMAT_VERSION_CONTAINER;
+    return supportedVersion &&
            (header.flags & FOLDCOMP_FORMAT_FLAG_CONTAINER) != 0 &&
            header.nResidue == 0 &&
            header.nAtom == 0;
@@ -123,6 +131,7 @@ static bool writeContainer(
     for (const auto& fragment : fragments) {
         uint8_t chainLen = static_cast<uint8_t>(std::min<size_t>(255, fragment.chain.size()));
         uint32_t payloadSize = static_cast<uint32_t>(fragment.payload.size());
+        os.write(reinterpret_cast<const char*>(&fragment.kind), sizeof(fragment.kind));
         os.write(reinterpret_cast<const char*>(&fragment.model), sizeof(fragment.model));
         os.write(reinterpret_cast<const char*>(&chainLen), sizeof(chainLen));
         if (chainLen > 0) {
@@ -174,8 +183,14 @@ static bool readContainer(
     fragments.reserve(nFragments);
     for (uint32_t i = 0; i < nFragments; i++) {
         ContainerFragment fragment;
+        fragment.kind = CONTAINER_FRAGMENT_KIND_FCZ;
         uint8_t chainLen = 0;
         uint32_t payloadSize = 0;
+        if (header.version >= FOLDCOMP_FORMAT_VERSION_CONTAINER) {
+            if (!readBinaryValue(data, size, offset, fragment.kind)) {
+                return false;
+            }
+        }
         if (!readBinaryValue(data, size, offset, fragment.model) ||
             !readBinaryValue(data, size, offset, chainLen)) {
             return false;
@@ -229,6 +244,61 @@ static void writeTitleLines(const std::string& title, std::ostream& pdb_stream) 
         remainingHeader -= 70;
         continuation++;
     }
+}
+
+static bool residueNeedsRawFallback(const std::vector<AtomCoordinate>& residueAtoms) {
+    if (residueAtoms.empty()) {
+        return false;
+    }
+    auto aaIt = Foldcomp::AAS.find(residueAtoms[0].residue);
+    if (aaIt == Foldcomp::AAS.end()) {
+        return true;
+    }
+    std::set<std::string> sourceAtoms;
+    for (const auto& atom : residueAtoms) {
+        sourceAtoms.insert(atom.atom);
+    }
+
+    std::set<std::string> canonicalAtoms(aaIt->second.atoms.begin(), aaIt->second.atoms.end());
+    std::set<std::string> canonicalAtomsWithOxt = canonicalAtoms;
+    canonicalAtomsWithOxt.insert("OXT");
+
+    for (const auto& atom : sourceAtoms) {
+        if (canonicalAtomsWithOxt.find(atom) == canonicalAtomsWithOxt.end()) {
+            return true;
+        }
+    }
+    return sourceAtoms != canonicalAtoms && sourceAtoms != canonicalAtomsWithOxt;
+}
+
+static bool regionNeedsRawFallback(const tcb::span<AtomCoordinate>& atoms) {
+    std::vector<std::vector<AtomCoordinate>> residues = splitAtomByResidue(atoms);
+    size_t residuesWithOxt = 0;
+    for (size_t i = 0; i < residues.size(); i++) {
+        bool hasOxt = false;
+        for (const auto& atom : residues[i]) {
+            if (atom.atom == "OXT") {
+                hasOxt = true;
+                break;
+            }
+        }
+        if (!hasOxt) {
+            continue;
+        }
+        residuesWithOxt++;
+        if (i + 1 != residues.size()) {
+            return true;
+        }
+    }
+    if (residuesWithOxt > 1) {
+        return true;
+    }
+    for (const auto& residue : residues) {
+        if (residueNeedsRawFallback(residue)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void writeSegmentsToPDB(
@@ -321,6 +391,8 @@ int rmsd(const std::string& pdb1, const std::string& pdb2) {
     reader.load(pdb2);
     std::vector<AtomCoordinate> atomCoordinates2;
     reader.readAllAtoms(atomCoordinates2);
+    removeAlternativePosition(atomCoordinates1);
+    removeAlternativePosition(atomCoordinates2);
     // Check
     if (atomCoordinates1.size() == 0) {
         std::cerr << "[Error] No atoms found in the input file: " << pdb1 << std::endl;
@@ -334,13 +406,111 @@ int rmsd(const std::string& pdb1, const std::string& pdb2) {
         std::cerr << "[Error] The number of atoms in the two files are different." << std::endl;
         return 1;
     }
-    std::vector<AtomCoordinate> backbone1 = filterBackbone(atomCoordinates1);
-    std::vector<AtomCoordinate> backbone2 = filterBackbone(atomCoordinates2);
+
+    std::vector<AtomCoordinate> alignedAtoms1;
+    std::vector<AtomCoordinate> alignedAtoms2;
+    std::vector<AtomCoordinate> alignedBackbone1;
+    std::vector<AtomCoordinate> alignedBackbone2;
+
+    using ResidueKey = std::tuple<int, std::string, int, int>;
+    auto groupResiduesForRmsd = [](const std::vector<AtomCoordinate>& atoms) {
+        std::map<ResidueKey, std::vector<AtomCoordinate>> residues;
+        if (atoms.empty()) {
+            return residues;
+        }
+        std::map<std::tuple<int, std::string, int>, int> occurrences;
+        size_t residueStart = 0;
+        for (size_t i = 1; i <= atoms.size(); i++) {
+            bool endOfResidue = (i == atoms.size()) ||
+                                atoms[i].model != atoms[i - 1].model ||
+                                atoms[i].chain != atoms[i - 1].chain ||
+                                atoms[i].residue_index != atoms[i - 1].residue_index;
+            if (!endOfResidue) {
+                continue;
+            }
+            const AtomCoordinate& first = atoms[residueStart];
+            std::tuple<int, std::string, int> baseKey(
+                first.model, first.chain, first.residue_index
+            );
+            ResidueKey key(
+                first.model, first.chain, first.residue_index, occurrences[baseKey]++
+            );
+            std::vector<AtomCoordinate>& residue = residues[key];
+            residue.insert(residue.end(), atoms.begin() + residueStart, atoms.begin() + i);
+            residueStart = i;
+        }
+        return residues;
+    };
+
+    std::map<ResidueKey, std::vector<AtomCoordinate>> residues1 = groupResiduesForRmsd(atomCoordinates1);
+    std::map<ResidueKey, std::vector<AtomCoordinate>> residues2 = groupResiduesForRmsd(atomCoordinates2);
+    if (residues1.size() != residues2.size()) {
+        std::cerr << "[Error] Residue counts differ between the two files." << std::endl;
+        return 1;
+    }
+
+    auto atomSorter = [](const AtomCoordinate& a, const AtomCoordinate& b) {
+        if (a.atom != b.atom) {
+            return a.atom < b.atom;
+        }
+        if (a.residue != b.residue) {
+            return a.residue < b.residue;
+        }
+        if (a.chain != b.chain) {
+            return a.chain < b.chain;
+        }
+        return a.atom_index < b.atom_index;
+    };
+
+    for (const auto& kv : residues1) {
+        auto it = residues2.find(kv.first);
+        if (it == residues2.end() || kv.second.empty() || it->second.empty()) {
+            std::cerr << "[Error] Residue identity mismatch between the two files." << std::endl;
+            return 1;
+        }
+        const AtomCoordinate& left = kv.second.front();
+        const AtomCoordinate& right = it->second.front();
+        if (left.residue != right.residue || kv.second.size() != it->second.size()) {
+            std::cerr << "[Error] Residue identity mismatch between the two files." << std::endl;
+            return 1;
+        }
+
+        std::vector<AtomCoordinate> sorted1 = kv.second;
+        std::vector<AtomCoordinate> sorted2 = it->second;
+        std::sort(sorted1.begin(), sorted1.end(), atomSorter);
+        std::sort(sorted2.begin(), sorted2.end(), atomSorter);
+        for (size_t atomIdx = 0; atomIdx < sorted1.size(); atomIdx++) {
+            if (sorted1[atomIdx].atom != sorted2[atomIdx].atom) {
+                std::cerr << "[Error] Atom identity mismatch between the two files." << std::endl;
+                return 1;
+            }
+            alignedAtoms1.push_back(sorted1[atomIdx]);
+            alignedAtoms2.push_back(sorted2[atomIdx]);
+        }
+
+        auto appendBackboneAtom = [&](const std::string& atomName) {
+            auto leftIt = std::find_if(
+                sorted1.begin(), sorted1.end(),
+                [&](const AtomCoordinate& atom) { return atom.atom == atomName; }
+            );
+            auto rightIt = std::find_if(
+                sorted2.begin(), sorted2.end(),
+                [&](const AtomCoordinate& atom) { return atom.atom == atomName; }
+            );
+            if (leftIt != sorted1.end() && rightIt != sorted2.end()) {
+                alignedBackbone1.push_back(*leftIt);
+                alignedBackbone2.push_back(*rightIt);
+            }
+        };
+        appendBackboneAtom("N");
+        appendBackboneAtom("CA");
+        appendBackboneAtom("C");
+    }
     // Print
     std::cout << pdb1 << '\t' << pdb2 << '\t';
-    std::cout << backbone1.size() / 3 << '\t' << atomCoordinates1.size() << '\t';
-    std::cout << RMSD(backbone1, backbone2) << '\t';
-    std::cout << RMSD(atomCoordinates1, atomCoordinates2) << std::endl;
+    std::cout << alignedBackbone1.size() / 3 << '\t' << alignedAtoms1.size() << '\t';
+    std::cout << RMSD(alignedBackbone1, alignedBackbone2) << '\t';
+    std::cout << RMSD(alignedAtoms1, alignedAtoms2) << std::endl;
     return 0;
 }
 
@@ -667,8 +837,8 @@ int main(int argc, char* const *argv) {
                 reader.loadFromBuffer(dataBuffer, size, base);
                 reader.readAllAtoms(atomCoordinates);
                 if (atomCoordinates.size() == 0) {
-                    std::cerr << "[Error] No atoms found in the input file: " << base << std::endl;
-                    return false;
+                    std::cerr << "[Warning] No protein atoms found in the input file: " << base << std::endl;
+                    return true;
                 }
 
                 // replace the title with only the base name if it was the same as the file name
@@ -683,41 +853,77 @@ int main(int argc, char* const *argv) {
                     std::vector<std::pair<size_t, size_t>> frag_indices = identifyDiscontinousResInd(
                         atomCoordinates, chain_indices[i].first, chain_indices[i].second
                     );
+                    if (frag_indices.empty()) {
+                        frag_indices.push_back(chain_indices[i]);
+                    }
                     if (skip_discontinuous && frag_indices.size() > 1) {
                         std::string message = "Skipping discontinuous chain: " + base + "\n";
                         std::cerr << message;
                         continue;
                     }
                     for (size_t j = 0; j < frag_indices.size(); j++) {
-                        tcb::span<AtomCoordinate> frag_span = tcb::span<AtomCoordinate>(
+                        tcb::span<AtomCoordinate> chain_span = tcb::span<AtomCoordinate>(
                             &atomCoordinates[frag_indices[j].first],
                             atomCoordinates.data() + frag_indices[j].second
                         );
-                        Foldcomp compRes;
-                        compRes.strTitle = title;
-                        compRes.anchorThreshold = anchor_residue_threshold;
-                        compData = compRes.compress(frag_span);
-                        if (compData.empty()) {
-                            std::cerr << "[Warning] Skipping fragment with incomplete backbone: " << base << std::endl;
+                        std::vector<BackboneRegion> regions = identifyBackboneRegions(chain_span);
+                        if (regions.empty()) {
+                            std::cerr << "[Warning] Skipping empty fragment: " << base << std::endl;
                             continue;
                         }
-                        std::ostringstream oss;
-                        compRes.writeStream(oss);
-                        ContainerFragment containerFragment;
-                        containerFragment.model = atomCoordinates[frag_indices[j].first].model;
-                        containerFragment.chain = atomCoordinates[frag_indices[j].first].chain;
-                        containerFragment.payload = oss.str();
-                        encodedFragments.push_back(std::move(containerFragment));
-                        compData.clear();
+                        if (regions.size() > 1 ||
+                            regions[0].start != 0 ||
+                            regions[0].end != chain_span.size() ||
+                            !regions[0].encodable) {
+                            std::cerr << "[Warning] Using mixed encodings for unsupported residues: "
+                                      << base << std::endl;
+                        }
+                        for (const auto& region : regions) {
+                            tcb::span<AtomCoordinate> region_span(
+                                chain_span.data() + region.start,
+                                chain_span.data() + region.end
+                            );
+                            ContainerFragment containerFragment;
+                            containerFragment.model = chain_span[region.start].model;
+                            containerFragment.chain = chain_span[region.start].chain;
+                            bool useFoldcompEncoding = region.encodable && !regionNeedsRawFallback(region_span);
+                            if (useFoldcompEncoding) {
+                                Foldcomp compRes;
+                                compRes.strTitle = title;
+                                compRes.anchorThreshold = anchor_residue_threshold;
+                                compData = compRes.compress(region_span);
+                                if (compData.empty()) {
+                                    std::cerr << "[Warning] Skipping fragment with incomplete backbone: "
+                                              << base << std::endl;
+                                    continue;
+                                }
+                                std::ostringstream oss;
+                                compRes.writeStream(oss);
+                                containerFragment.kind = CONTAINER_FRAGMENT_KIND_FCZ;
+                                containerFragment.payload = oss.str();
+                                compData.clear();
+                            } else {
+                                std::vector<AtomCoordinate> rawAtoms(region_span.begin(), region_span.end());
+                                containerFragment.kind = CONTAINER_FRAGMENT_KIND_RAW_ATOMS;
+                                if (!serializeAtomCoordinates(rawAtoms, containerFragment.payload)) {
+                                    std::cerr << "[Error] Failed to serialize raw fragment: " << base << std::endl;
+                                    return false;
+                                }
+                            }
+                            encodedFragments.push_back(std::move(containerFragment));
+                        }
                     }
                 }
 
                 if (encodedFragments.empty()) {
-                    std::cerr << "[Warning] No encodable fragments found in input file: " << base << std::endl;
+                    std::cerr << "[Warning] No protein fragments found in input file: " << base << std::endl;
                     return true;
                 }
 
-                bool useContainer = encodedFragments.size() > 1;
+                bool useContainer = encodedFragments.size() > 1 ||
+                                    encodedFragments[0].kind != CONTAINER_FRAGMENT_KIND_FCZ ||
+                                    encodedFragments[0].chain.size() != 1 ||
+                                    encodedFragments[0].model != 1;
                 std::string encoded;
                 if (useContainer) {
                     std::ostringstream oss;
@@ -855,34 +1061,50 @@ int main(int argc, char* const *argv) {
                 if (isContainer) {
                     structureTitle = containerTitle;
                     for (const auto& fragment : containerFragments) {
-                        Foldcomp compRes;
-                        std::istringstream fragmentInput(fragment.payload);
-                        int flag = compRes.read(fragmentInput);
-                        if (flag != 0) {
-                            std::cerr << "[Error] Failed to read a container fragment." << std::endl;
-                            return false;
-                        }
-                        compRes.useAltAtomOrder = use_alt_order;
-                        if (check_before_decompression) {
-                            ValidityError err = compRes.checkValidity();
-                            if (err != ValidityError::SUCCESS) {
-                                printValidityError(err, compRes.strTitle);
-                                return true;
-                            }
-                        }
                         std::vector<AtomCoordinate> atomCoordinates;
-                        flag = compRes.decompress(atomCoordinates);
-                        if (flag != 0) {
-                            std::cerr << "[Error] decompressing container fragment." << std::endl;
-                            return false;
+                        if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_PDB) {
+                            StructureReader reader;
+                            if (!reader.loadFromBuffer(fragment.payload.data(), fragment.payload.size(), "fragment.pdb")) {
+                                std::cerr << "[Error] Failed to read a raw container fragment." << std::endl;
+                                return false;
+                            }
+                            reader.readAllAtoms(atomCoordinates);
+                        } else if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_ATOMS) {
+                            if (!deserializeAtomCoordinates(
+                                    fragment.payload.data(), fragment.payload.size(), atomCoordinates)) {
+                                std::cerr << "[Error] Failed to decode a raw atom fragment." << std::endl;
+                                return false;
+                            }
+                        } else {
+                            Foldcomp compRes;
+                            std::istringstream fragmentInput(fragment.payload);
+                            int flag = compRes.read(fragmentInput);
+                            if (flag != 0) {
+                                std::cerr << "[Error] Failed to read a container fragment." << std::endl;
+                                return false;
+                            }
+                            compRes.useAltAtomOrder = use_alt_order;
+                            if (check_before_decompression) {
+                                ValidityError err = compRes.checkValidity();
+                                if (err != ValidityError::SUCCESS) {
+                                    printValidityError(err, compRes.strTitle);
+                                    return true;
+                                }
+                            }
+                            flag = compRes.decompress(atomCoordinates);
+                            if (flag != 0) {
+                                std::cerr << "[Error] decompressing container fragment." << std::endl;
+                                return false;
+                            }
+                            if (structureTitle.empty()) {
+                                structureTitle = compRes.strTitle;
+                            }
                         }
                         for (auto& atom : atomCoordinates) {
                             atom.model = fragment.model;
+                            atom.chain = fragment.chain;
                         }
                         segments.push_back({fragment.model, std::move(atomCoordinates)});
-                        if (structureTitle.empty()) {
-                            structureTitle = compRes.strTitle;
-                        }
                     }
                 } else {
                     Foldcomp compRes;
@@ -1256,6 +1478,9 @@ int main(int argc, char* const *argv) {
                 bool isContainer = readContainer(dataBuffer, size, containerTitle, containerFragments);
                 if (isContainer) {
                     for (size_t fragmentIndex = 0; fragmentIndex < containerFragments.size(); fragmentIndex++) {
+                        if (containerFragments[fragmentIndex].kind == CONTAINER_FRAGMENT_KIND_RAW_PDB) {
+                            continue;
+                        }
                         Foldcomp compRes;
                         std::istringstream fragmentInput(containerFragments[fragmentIndex].payload);
                         int flag = compRes.read(fragmentInput);

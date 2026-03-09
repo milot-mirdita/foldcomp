@@ -85,6 +85,13 @@ else()
     add_subdirectory(lib/microtar)
     target_link_libraries(foldcomp PUBLIC microtar)
 
+    add_executable(foldcomp_audit
+        ${foldcomp_header_files}
+        ${foldcomp_source_files}
+        src/structure_reader.cpp
+        src/foldcomp_audit.cpp)
+    target_link_libraries(foldcomp_audit PUBLIC ZLIB::ZLIB)
+
     if(GCS_SUPPORT)
         find_package(google_cloud_cpp_storage REQUIRED)
         target_link_libraries(foldcomp PUBLIC google-cloud-cpp::storage)
@@ -94,18 +101,33 @@ endif()
 
 # always enable math defines like M_PI
 target_compile_definitions(foldcomp PUBLIC _USE_MATH_DEFINES=1)
+if(TARGET foldcomp_audit)
+    target_compile_definitions(foldcomp_audit PUBLIC _USE_MATH_DEFINES=1)
+endif()
 
 if(MSVC)
     target_compile_options(foldcomp PRIVATE /W4)
+    if(TARGET foldcomp_audit)
+        target_compile_options(foldcomp_audit PRIVATE /W4)
+    endif()
 else()
     target_compile_options(foldcomp PRIVATE -Wall -Wextra -Wpedantic)
+    if(TARGET foldcomp_audit)
+        target_compile_options(foldcomp_audit PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
 endif()
 
 if(BUILD_WERROR)
     if(MSVC)
         target_compile_options(foldcomp PRIVATE /WX)
+        if(TARGET foldcomp_audit)
+            target_compile_options(foldcomp_audit PRIVATE /WX)
+        endif()
     else()
         target_compile_options(foldcomp PRIVATE -Werror)
+        if(TARGET foldcomp_audit)
+            target_compile_options(foldcomp_audit PRIVATE -Werror)
+        endif()
     endif()
 endif()
 
@@ -115,4 +137,3 @@ if(BUILD_IWYU)
 endif()
 
 enable_testing()
-
