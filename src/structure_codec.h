@@ -33,6 +33,11 @@ enum ParsePdbStatus {
 };
 
 bool hasContainerMagic(const char* data, size_t size);
+bool parseStructureAtoms(
+    const char* data, size_t size, bool singleChainOnly,
+    std::vector<AtomCoordinate>& atoms, int& status,
+    std::string* title = nullptr, const char* format = nullptr
+);
 bool parsePDBAtoms(
     const char* data, size_t size, bool singleChainOnly,
     std::vector<AtomCoordinate>& atoms, int& status
@@ -62,3 +67,15 @@ void writeSegmentsToPDB(
     const std::string& title,
     std::string& output
 );
+
+#ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
+bool decodeStructureToMMCIF(
+    const char* data, size_t size, bool useAltOrder, std::string& title,
+    std::string& mmcifText
+);
+void writeSegmentsToMMCIF(
+    const std::vector<DecompressedSegment>& segments,
+    const std::string& title,
+    std::string& output
+);
+#endif

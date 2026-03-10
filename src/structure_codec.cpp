@@ -2,6 +2,10 @@
 
 #include "foldcomp.h"
 
+#ifdef FOLDCOMP_WITH_STRUCTURE_READER
+#include "structure_reader.h"
+#endif
+
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -138,6 +142,69 @@ bool parsePDBAtoms(
         return false;
     }
     return true;
+}
+
+bool parseStructureAtoms(
+    const char* data, size_t size, bool singleChainOnly,
+    std::vector<AtomCoordinate>& atoms, int& status, std::string* title, const char* format
+) {
+    atoms.clear();
+    if (title != nullptr) {
+        title->clear();
+    }
+    status = PARSE_PDB_OK;
+
+#ifdef FOLDCOMP_WITH_STRUCTURE_READER
+    StructureReader reader;
+    std::string inputName;
+    if (format == nullptr || format[0] == '\0' || strcmp(format, "pdb") == 0) {
+        inputName = "input.pdb";
+    } else if (strcmp(format, "mmcif") == 0 || strcmp(format, "cif") == 0) {
+        inputName = "input.cif";
+    } else {
+        status = PARSE_PDB_INVALID_FORMAT;
+        return false;
+    }
+    if (!reader.loadFromBuffer(data, size, inputName)) {
+        status = PARSE_PDB_INVALID_FORMAT;
+        return false;
+    }
+
+    if (title != nullptr) {
+        *title = reader.title;
+    }
+    reader.readAllAtoms(atoms);
+    if (atoms.empty()) {
+        status = PARSE_PDB_NO_ATOM;
+        return false;
+    }
+
+    if (singleChainOnly) {
+        std::string chain;
+        bool chainSet = false;
+        for (const auto& atom : atoms) {
+            if (!chainSet) {
+                chain = atom.chain;
+                chainSet = true;
+            } else if (atom.chain != chain) {
+                status = PARSE_PDB_MULTIPLE_CHAINS;
+                atoms.clear();
+                return false;
+            }
+        }
+    }
+    return true;
+#else
+    if (title != nullptr) {
+        title->clear();
+    }
+    if (format != nullptr && format[0] != '\0' &&
+        strcmp(format, "pdb") != 0) {
+        status = PARSE_PDB_INVALID_FORMAT;
+        return false;
+    }
+    return parsePDBAtoms(data, size, singleChainOnly, atoms, status);
+#endif
 }
 
 bool writeContainerToString(
@@ -285,6 +352,29 @@ void writeSegmentsToPDB(
     }
 }
 
+#ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
+void writeSegmentsToMMCIF(
+    const std::vector<DecompressedSegment>& segments,
+    const std::string& title,
+    std::string& output
+) {
+    std::vector<AtomCoordinate> atoms;
+    size_t totalAtoms = 0;
+    for (const auto& segment : segments) {
+        totalAtoms += segment.atoms.size();
+    }
+    atoms.reserve(totalAtoms);
+    for (const auto& segment : segments) {
+        for (const auto& atom : segment.atoms) {
+            AtomCoordinate copy = atom;
+            copy.model = segment.model;
+            atoms.push_back(std::move(copy));
+        }
+    }
+    writeAtomCoordinatesToMMCIF(atoms, title, output);
+}
+#endif
+
 bool decodeStructureToSegments(
     const char* data, size_t size, bool useAltOrder, std::string& title,
     std::vector<DecompressedSegment>& segments
@@ -374,3 +464,17 @@ bool decodeStructureToPDB(
     writeSegmentsToPDB(segments, title, pdbText);
     return true;
 }
+
+#ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
+bool decodeStructureToMMCIF(
+    const char* data, size_t size, bool useAltOrder, std::string& title,
+    std::string& mmcifText
+) {
+    std::vector<DecompressedSegment> segments;
+    if (!decodeStructureToSegments(data, size, useAltOrder, title, segments)) {
+        return false;
+    }
+    writeSegmentsToMMCIF(segments, title, mmcifText);
+    return true;
+}
+#endif

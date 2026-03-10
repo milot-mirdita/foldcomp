@@ -67,6 +67,13 @@ static int ext_merge = 1;
 static int ext_use_title = 0;
 static int overwrite = 0;
 
+static bool isMMCIFOutputPath(const std::string& path) {
+    return stringEndsWith(".cif", path) ||
+           stringEndsWith(".mmcif", path) ||
+           stringEndsWith(".cif.tar", path) ||
+           stringEndsWith(".mmcif.tar", path);
+}
+
 // version
 #define FOLDCOMP_VERSION "1.0.0"
 
@@ -508,11 +515,16 @@ int main(int argc, char* const *argv) {
     }
 
     std::string output;
+    bool useMMCIFOutput = false;
     if (argc == optind + 3) {
         has_output = 1;
         output = argv[optind + 2];
         if (stringEndsWith(".tar", output)) {
             save_as_tar = 1;
+        }
+        if (mode == DECOMPRESS && isMMCIFOutputPath(output)) {
+            useMMCIFOutput = true;
+            outputSuffix = stringEndsWith(".mmcif", output) || stringEndsWith(".mmcif.tar", output) ? "mmcif" : "cif";
         }
     }
 
@@ -956,21 +968,29 @@ int main(int argc, char* const *argv) {
                     outputFile = output + "/" + outputParts.first + "." + outputSuffix;
                 }
 
-                std::string pdbText;
-                writeSegmentsToPDB(segments, structureTitle, pdbText);
+                std::string structureText;
+#ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
+                if (useMMCIFOutput) {
+                    writeSegmentsToMMCIF(segments, structureTitle, structureText);
+                } else {
+                    writeSegmentsToPDB(segments, structureTitle, structureText);
+                }
+#else
+                writeSegmentsToPDB(segments, structureTitle, structureText);
+#endif
 
                 if (db_output) {
-                    pdbText.push_back('\0');
+                    structureText.push_back('\0');
 #pragma omp critical
                     {
-                        writer_append(handle, pdbText.c_str(), pdbText.size(), key, outputFile.c_str());
+                        writer_append(handle, structureText.c_str(), structureText.size(), key, outputFile.c_str());
                         key++;
                     }
                 } else if (save_as_tar) {
 #pragma omp critical
                     {
-                        mtar_write_file_header(&tar_out, outputFile.c_str(), pdbText.size());
-                        mtar_write_data(&tar_out, pdbText.c_str(), pdbText.size());
+                        mtar_write_file_header(&tar_out, outputFile.c_str(), structureText.size());
+                        mtar_write_data(&tar_out, structureText.c_str(), structureText.size());
                     }
                 } else {
                     // Write decompressed data to file
@@ -984,9 +1004,9 @@ int main(int argc, char* const *argv) {
                         std::cerr << "[Error] Writing decompressed data to file: " << output << std::endl;
                         return false;
                     }
-                    size_t written = fwrite(pdbText.data(), 1, pdbText.size(), out);
+                    size_t written = fwrite(structureText.data(), 1, structureText.size(), out);
                     fclose(out);
-                    if (written != pdbText.size()) {
+                    if (written != structureText.size()) {
                         std::cerr << "[Error] Writing decompressed data to file: " << output << std::endl;
                         return false;
                     }

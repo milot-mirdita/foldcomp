@@ -14,11 +14,20 @@
 #include "atom_coordinate.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+
+#ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
+#include "gemmi/model.hpp"
+#define GEMMI_WRITE_IMPLEMENTATION
+#include "gemmi/to_mmcif.hpp"
+#include "gemmi/to_cif.hpp"
+#include <sstream>
+#endif
 
 namespace {
 
@@ -144,6 +153,36 @@ void appendTitleLines(std::string& output, const std::string& title) {
         continuation++;
     }
 }
+
+#ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
+std::string sanitizeMMCIFDataName(const std::string& title) {
+    if (title.empty()) {
+        return "foldcomp";
+    }
+    std::string output;
+    output.reserve(title.size());
+    for (char ch : title) {
+        unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::isalnum(uch) || ch == '_') {
+            output.push_back(ch);
+        } else {
+            output.push_back('_');
+        }
+    }
+    if (output.empty() || output[0] == '_' || output[0] == '#') {
+        output.insert(output.begin(), 'd');
+    }
+    return output;
+}
+
+gemmi::Element inferGemmiElement(const std::string& atomName) {
+    const char* ptr = atomName.c_str();
+    while (*ptr != '\0' && !std::isalpha(static_cast<unsigned char>(*ptr))) {
+        ++ptr;
+    }
+    return gemmi::find_element(ptr);
+}
+#endif
 
 }
 
@@ -370,6 +409,81 @@ int writeAtomCoordinatesToPDBFile(
     fclose(pdb_file);
     return written == output.size() ? 0 : 1;
 }
+
+#ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
+bool writeAtomCoordinatesToMMCIF(
+    std::vector<AtomCoordinate>& atoms, const std::string& title, std::string& output
+) {
+    gemmi::Structure st;
+    st.name = sanitizeMMCIFDataName(title);
+    if (!title.empty()) {
+        st.info["_entry.id"] = st.name;
+        st.info["_struct.title"] = title;
+    }
+
+    std::vector<std::pair<size_t, size_t>> residueRanges = splitResidueRanges(tcb::span<AtomCoordinate>(atoms.data(), atoms.size()));
+    int currentModel = 0;
+    std::string currentChain;
+    int currentLabelSeq = 0;
+    gemmi::Model* model = nullptr;
+    gemmi::Chain* chain = nullptr;
+
+    for (const auto& residueRange : residueRanges) {
+        const AtomCoordinate& firstAtom = atoms[residueRange.first];
+        if (model == nullptr || firstAtom.model != currentModel) {
+            st.models.emplace_back(std::to_string(firstAtom.model));
+            model = &st.models.back();
+            chain = nullptr;
+            currentModel = firstAtom.model;
+            currentChain.clear();
+            currentLabelSeq = 0;
+        }
+        if (chain == nullptr || firstAtom.chain != currentChain) {
+            model->chains.emplace_back(firstAtom.chain);
+            chain = &model->chains.back();
+            currentChain = firstAtom.chain;
+            currentLabelSeq = 0;
+        }
+        currentLabelSeq++;
+
+        gemmi::Residue residue;
+        residue.name = firstAtom.residue;
+        residue.seqid = gemmi::SeqId(firstAtom.residue_index, ' ');
+        residue.subchain = currentChain;
+        residue.entity_id = "1";
+        residue.label_seq = currentLabelSeq;
+        residue.entity_type = gemmi::EntityType::Polymer;
+        residue.het_flag = 'A';
+
+        for (size_t atomIndex = residueRange.first; atomIndex < residueRange.second; atomIndex++) {
+            const AtomCoordinate& atomCoordinate = atoms[atomIndex];
+            gemmi::Atom atom;
+            atom.name = atomCoordinate.atom;
+            atom.serial = atomCoordinate.atom_index;
+            atom.pos = gemmi::Position(atomCoordinate.coordinate.x, atomCoordinate.coordinate.y, atomCoordinate.coordinate.z);
+            atom.occ = atomCoordinate.occupancy > 0.0f ? atomCoordinate.occupancy : 1.0f;
+            atom.b_iso = atomCoordinate.tempFactor;
+            atom.element = inferGemmiElement(atomCoordinate.atom);
+            residue.atoms.push_back(std::move(atom));
+        }
+        chain->residues.push_back(std::move(residue));
+    }
+
+    gemmi::MmcifOutputGroups groups(false);
+    groups.atoms = true;
+    groups.block_name = true;
+    groups.entry = true;
+    groups.title_keywords = !title.empty();
+    groups.struct_asym = true;
+    groups.group_pdb = true;
+
+    gemmi::cif::Document doc = gemmi::make_mmcif_document(st, groups);
+    std::ostringstream stream;
+    gemmi::cif::write_cif_to_stream(stream, doc, gemmi::cif::Style::Pdbx);
+    output = stream.str();
+    return true;
+}
+#endif
 
 std::vector< std::vector<AtomCoordinate> > splitAtomByResidue(
     const tcb::span<AtomCoordinate>& atomCoordinates

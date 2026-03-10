@@ -22,7 +22,8 @@ typedef struct {
 } FoldcompDatabaseObject;
 
 int decompress(const char* input, size_t input_size, bool use_alt_order, std::string& output, std::string& name);
-PyObject* getDataFromPDB(const std::string& pdb_input);
+int decompress(const char* input, size_t input_size, bool use_alt_order, const std::string& format, std::string& output, std::string& name);
+PyObject* getDataFromStructureText(const std::string& input, const char* format);
 static PyObject* FoldcompDatabase_close(PyObject* self);
 static PyObject* FoldcompDatabase_enter(PyObject* self);
 static PyObject* FoldcompDatabase_exit(PyObject* self, PyObject* args);
@@ -223,25 +224,48 @@ static PyObject *FoldcompDatabase_exit(PyObject *self, PyObject* /* args */) {
 
 // Decompress
 int decompress(const char* input, size_t input_size, bool use_alt_order, std::string& output, std::string& name) {
+    return decompress(input, input_size, use_alt_order, "pdb", output, name);
+}
+
+int decompress(
+    const char* input, size_t input_size, bool use_alt_order, const std::string& format,
+    std::string& output, std::string& name
+) {
     CoutStateGuard coutStateGuard;
     std::cout.setstate(std::ios_base::failbit);
+#ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
+    if (format == "mmcif" || format == "cif") {
+        if (!decodeStructureToMMCIF(input, input_size, use_alt_order, name, output)) {
+            return 1;
+        }
+        return 0;
+    }
+#endif
+    if (format != "pdb") {
+        return 2;
+    }
     if (!decodeStructureToPDB(input, input_size, use_alt_order, name, output)) {
         return 1;
     }
     return 0;
 }
 // Python binding for decompress
-static PyObject *foldcomp_decompress(PyObject* /* self */, PyObject *args) {
-    // Unpack a string from the arguments
+static PyObject *foldcomp_decompress(PyObject* /* self */, PyObject *args, PyObject* kwargs) {
     const char *strArg;
     Py_ssize_t strSize;
-    if (!PyArg_ParseTuple(args, "y#", &strArg, &strSize)) {
+    const char* format = "pdb";
+    static const char* kwlist[] = {"input", "format", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y#|$s", const_cast<char**>(kwlist), &strArg, &strSize, &format)) {
         return NULL;
     }
 
     std::string output;
     std::string name;
-    int err = decompress(strArg, strSize, false, output, name);
+    int err = decompress(strArg, strSize, false, format, output, name);
+    if (err == 2) {
+        PyErr_SetString(PyExc_ValueError, "format must be 'pdb' or 'mmcif'");
+        return NULL;
+    }
     if (err != 0) {
         PyErr_SetString(FoldcompError, "Error decompressing.");
         return NULL;
@@ -257,10 +281,13 @@ static PyObject *foldcomp_decompress(PyObject* /* self */, PyObject *args) {
 }
 
 // Compress
-int compress(const std::string& name, const std::string& pdb_input, std::string& output, int anchor_residue_threshold) {
+int compress(
+    const std::string& name, const std::string& pdb_input, const char* format,
+    std::string& output, int anchor_residue_threshold
+) {
     std::vector<AtomCoordinate> atomCoordinates;
     int status = 0;
-    if (!parsePDBAtoms(pdb_input.data(), pdb_input.size(), true, atomCoordinates, status)) {
+    if (!parseStructureAtoms(pdb_input.data(), pdb_input.size(), true, atomCoordinates, status, nullptr, format)) {
         return status;
     }
 
@@ -281,9 +308,10 @@ int compress(const std::string& name, const std::string& pdb_input, std::string&
 static PyObject *foldcomp_compress(PyObject* /* self */, PyObject *args, PyObject* kwargs) {
     const char* name;
     const char* pdb_input;
+    const char* format = "pdb";
     PyObject* anchor_residue_threshold = NULL;
-    static const char *kwlist[] = {"name", "pdb_content", "anchor_residue_threshold", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "ss|$O", const_cast<char**>(kwlist), &name, &pdb_input, &anchor_residue_threshold)) {
+    static const char *kwlist[] = {"name", "pdb_content", "format", "anchor_residue_threshold", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "ss|$sO", const_cast<char**>(kwlist), &name, &pdb_input, &format, &anchor_residue_threshold)) {
         return NULL;
     }
 
@@ -298,15 +326,15 @@ static PyObject *foldcomp_compress(PyObject* /* self */, PyObject *args, PyObjec
     }
 
     std::string output;
-    int flag = compress(name, pdb_input, output, threshold);
+    int flag = compress(name, pdb_input, format, output, threshold);
     if (flag == PARSE_PDB_NO_ATOM) {
-        PyErr_SetString(FoldcompError, "No ATOM lines found");
+        PyErr_SetString(FoldcompError, "No protein atoms found");
         return NULL;
     } else if (flag == PARSE_PDB_MULTIPLE_CHAINS) {
         PyErr_SetString(FoldcompError, "Multiple chains found. Please provide a single chain using 'foldcomp.split_pdb_by_chain'");
         return NULL;
     } else if (flag == PARSE_PDB_INVALID_FORMAT) {
-        PyErr_SetString(PyExc_ValueError, "Invalid PDB ATOM record");
+        PyErr_SetString(PyExc_ValueError, "Invalid structure input or format");
         return NULL;
     } else if (flag != 0) {
         PyErr_SetString(FoldcompError, "Error compressing");
@@ -626,18 +654,18 @@ PyObject* getDataFromFCZ(const char* input, size_t input_size) {
 }
 
 // 02. Extract information starting from PDB
-PyObject* getDataFromPDB(const std::string& pdb_input) {
+PyObject* getDataFromStructureText(const std::string& pdb_input, const char* format) {
     std::vector<AtomCoordinate> atomCoordinates;
     int status = 0;
-    if (!parsePDBAtoms(pdb_input.data(), pdb_input.size(), false, atomCoordinates, status)) {
+    if (!parseStructureAtoms(pdb_input.data(), pdb_input.size(), false, atomCoordinates, status, nullptr, format)) {
         if (status == PARSE_PDB_NO_ATOM) {
-            PyErr_SetString(PyExc_ValueError, "No ATOM lines found in PDB file");
+            PyErr_SetString(PyExc_ValueError, "No protein atoms found in structure input");
             return NULL;
         } else if (status == PARSE_PDB_INVALID_FORMAT) {
-            PyErr_SetString(PyExc_ValueError, "Invalid PDB ATOM record");
+            PyErr_SetString(PyExc_ValueError, "Invalid structure input or format");
             return NULL;
         }
-        PyErr_SetString(PyExc_ValueError, "Could not parse PDB file");
+        PyErr_SetString(PyExc_ValueError, "Could not parse structure input");
         return NULL;
     }
 
@@ -656,8 +684,9 @@ PyObject* getDataFromPDB(const std::string& pdb_input) {
 static PyObject* foldcomp_get_data(PyObject* /* self */, PyObject* args, PyObject* kwargs) {
     const char* input;
     Py_ssize_t input_size;
-    static const char* kwlist[] = { "input", NULL };
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y#", (char**)kwlist, &input, &input_size)) {
+    const char* format = "pdb";
+    static const char* kwlist[] = { "input", "format", NULL };
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y#|$s", (char**)kwlist, &input, &input_size, &format)) {
         return NULL;
     }
     // Check input
@@ -671,7 +700,7 @@ static PyObject* foldcomp_get_data(PyObject* /* self */, PyObject* args, PyObjec
         return getDataFromFCZ(input, input_size);
     } else if (input_size >= 4) {
         std::string pdb_input(input, input_size);
-        return getDataFromPDB(pdb_input);
+        return getDataFromStructureText(pdb_input, format);
     } else {
         PyErr_SetString(PyExc_ValueError, "Input is not a FCZ file or PDB file");
         return NULL;
@@ -685,7 +714,7 @@ static PyObject* foldcomp_get_data(PyObject* /* self */, PyObject* args, PyObjec
 #pragma GCC diagnostic ignored "-Wcast-function-type"
 static PyMethodDef foldcomp_methods[] = {
     // {"compress", foldcomp_compress, METH_VARARGS, "Compress a PDB file."},
-    {"decompress", foldcomp_decompress, METH_VARARGS, "Decompress FCZ content to PDB."},
+    {"decompress", (PyCFunction)foldcomp_decompress, METH_VARARGS | METH_KEYWORDS, "Decompress Foldcomp content to PDB or mmCIF."},
     {"compress", (PyCFunction)foldcomp_compress, METH_VARARGS | METH_KEYWORDS, "Compress PDB content to FCZ."},
     {"open", (PyCFunction)foldcomp_open, METH_VARARGS | METH_KEYWORDS, "Open a Foldcomp database."},
     {"get_data", (PyCFunction)foldcomp_get_data, METH_VARARGS | METH_KEYWORDS, "Get data from FCZ or PDB content."},

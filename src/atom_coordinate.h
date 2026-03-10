@@ -88,6 +88,12 @@ int writeAtomCoordinatesToPDBFile(
     std::vector<AtomCoordinate>& atoms, const std::string& title, const std::string& pdb_path
 );
 
+#ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
+bool writeAtomCoordinatesToMMCIF(
+    std::vector<AtomCoordinate>& atoms, const std::string& title, std::string& output
+);
+#endif
+
 std::vector<std::vector<AtomCoordinate>> splitAtomByResidue(
     const tcb::span<AtomCoordinate>& atomCoordinates
 );

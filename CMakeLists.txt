@@ -32,6 +32,8 @@ if(BUILD_LIBRARY)
         ${foldcomp_header_files}
         ${foldcomp_source_files})
 elseif(BUILD_PYTHON)
+        include_directories(lib)
+        include_directories(lib/gemmi)
         if(MSVC)
             install(FILES lib/windows/dirent.h DESTINATION include)
         endif(MSVC)
@@ -41,7 +43,10 @@ elseif(BUILD_PYTHON)
         add_library(foldcomp MODULE
             ${foldcomp_header_files}
             ${foldcomp_source_files}
+            src/structure_reader.cpp
             foldcomp/foldcomp.cxx)
+        target_compile_definitions(foldcomp PRIVATE FOLDCOMP_WITH_MMCIF_OUTPUT)
+        target_compile_definitions(foldcomp PRIVATE FOLDCOMP_WITH_STRUCTURE_READER)
         python_extension_module(foldcomp)
         install(TARGETS foldcomp LIBRARY DESTINATION foldcomp)
 else()
@@ -54,6 +59,8 @@ else()
         ${foldcomp_exe_source_files})
 
     target_compile_definitions(foldcomp PUBLIC FOLDCOMP_EXECUTABLE)
+    target_compile_definitions(foldcomp PRIVATE FOLDCOMP_WITH_MMCIF_OUTPUT)
+    target_compile_definitions(foldcomp PRIVATE FOLDCOMP_WITH_STRUCTURE_READER)
     # For debugging
     # target_compile_definitions(foldcomp PUBLIC _GLIBCXX_DEBUG=1 _LIBCPP_DEBUG=1)
     
@@ -71,6 +78,7 @@ else()
         endif()
         find_package(ZLIB REQUIRED)
         target_link_libraries(foldcomp PUBLIC ZLIB::ZLIB)
+        target_compile_definitions(foldcomp PRIVATE FOLDCOMP_WITH_ZLIB)
     else()
         # For webassembly, not using openmp. zlib is added to compile flags
         set_target_properties(
@@ -93,6 +101,9 @@ else()
             src/structure_reader.cpp
             src/foldcomp_audit.cpp)
         target_link_libraries(foldcomp_audit PUBLIC ZLIB::ZLIB)
+        target_compile_definitions(foldcomp_audit PRIVATE FOLDCOMP_WITH_MMCIF_OUTPUT)
+        target_compile_definitions(foldcomp_audit PRIVATE FOLDCOMP_WITH_STRUCTURE_READER)
+        target_compile_definitions(foldcomp_audit PRIVATE FOLDCOMP_WITH_ZLIB)
     endif()
 
     if(GCS_SUPPORT)

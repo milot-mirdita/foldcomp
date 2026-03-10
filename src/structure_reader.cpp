@@ -14,12 +14,29 @@
 #include "structure_reader.h"
 
 #include <stdexcept>
+#ifdef FOLDCOMP_WITH_ZLIB
 #include <zlib.h>
-// Gemmi
 #include "gemmi/gz.hpp"
+#endif
+// Gemmi
 #include "gemmi/input.hpp"
 #include "gemmi/mmread.hpp"
 #include "gemmi/resinfo.hpp"
+
+namespace {
+
+bool isCompressedPath(const std::string& path) {
+    return path.size() >= 3 && path.compare(path.size() - 3, 3, ".gz") == 0;
+}
+
+std::string basePath(const std::string& path) {
+    if (isCompressedPath(path)) {
+        return path.substr(0, path.size() - 3);
+    }
+    return path;
+}
+
+}
 
 /**
  * @brief StructureReader::updateStructure
@@ -96,10 +113,9 @@ void StructureReader::updateStructure(void* void_st, const std::string& filename
  */
 bool StructureReader::loadFromBuffer(const char* buffer, size_t bufferSize, const std::string& name) {
     try {
-        gemmi::MaybeGzipped infile(name);
         gemmi::Structure st;
-        // If infile is a compressed file, we need to uncompress buffer using zlib
-        if (infile.is_compressed()) {
+        if (isCompressedPath(name)) {
+#ifdef FOLDCOMP_WITH_ZLIB
             char* uncompBuffer;
             size_t uncompBufferSize;
             int ret = uncompressBuffer(const_cast<const char**>(&uncompBuffer), &uncompBufferSize, buffer, bufferSize);
@@ -108,10 +124,13 @@ bool StructureReader::loadFromBuffer(const char* buffer, size_t bufferSize, cons
             }
             st = gemmi::read_structure_from_char_array(uncompBuffer, uncompBufferSize, name);
             free(uncompBuffer);
-        } else {
-            st = gemmi::read_structure_from_char_array(const_cast<char*>(buffer), bufferSize, name);
+            updateStructure((void*)&st, name);
+            return true;
+#else
+            return false;
+#endif
         }
-
+        st = gemmi::read_structure_from_char_array(const_cast<char*>(buffer), bufferSize, name);
         updateStructure((void*)&st, name);
     }
     catch (const std::exception&) {
@@ -128,14 +147,24 @@ bool StructureReader::loadFromBuffer(const char* buffer, size_t bufferSize, cons
  * @return gemmi::Structure
  */
 gemmi::Structure openStructure(const std::string& filename) {
-    gemmi::MaybeGzipped infile(filename);
-    gemmi::CoorFormat format = gemmi::coor_format_from_ext(infile.basepath());
+    if (isCompressedPath(filename)) {
+#ifdef FOLDCOMP_WITH_ZLIB
+        gemmi::MaybeGzipped infile(filename);
+        gemmi::CoorFormat format = gemmi::coor_format_from_ext(infile.basepath());
+        if (format != gemmi::CoorFormat::Unknown && format != gemmi::CoorFormat::Unknown) {
+            return gemmi::read_structure(infile, format);
+        }
+        return gemmi::read_structure(infile, gemmi::CoorFormat::Pdb);
+#else
+        throw std::runtime_error("gzipped structure input requires zlib support");
+#endif
+    }
+    gemmi::BasicInput infile(filename);
+    gemmi::CoorFormat format = gemmi::coor_format_from_ext(basePath(filename));
     if (format != gemmi::CoorFormat::Unknown && format != gemmi::CoorFormat::Unknown) {
         return gemmi::read_structure(infile, format);
     }
-    else {
-        return gemmi::read_structure(infile, gemmi::CoorFormat::Pdb);
-    }
+    return gemmi::read_structure(infile, gemmi::CoorFormat::Pdb);
 }
 
 /**
@@ -176,6 +205,7 @@ bool StructureReader::readAllAtoms(std::vector<AtomCoordinate>& allAtoms){
     return true;
 }
 
+#ifdef FOLDCOMP_WITH_ZLIB
 int uncompressBuffer(
     const char** uncompBuffer, size_t* uncompBufferSize,
     const char* origBuffer, size_t origBufferSize
@@ -224,3 +254,4 @@ int uncompressBuffer(
     *uncompBufferSize = current - buffer;
     return 0;
 }
+#endif
