@@ -44,6 +44,18 @@ void appendBytes(std::string& output, const std::vector<T>& values) {
     memcpy(output.data() + offset, values.data(), bytes);
 }
 
+template <typename T>
+void appendByteVector(std::string& output, const std::vector<T>& values) {
+    if (values.empty()) {
+        return;
+    }
+    size_t offset = output.size();
+    output.resize(offset + values.size());
+    for (size_t i = 0; i < values.size(); i++) {
+        output[offset + i] = static_cast<char>(values[i]);
+    }
+}
+
 }
 
 // Changed at 2022-04-14 16:02:30
@@ -1252,10 +1264,10 @@ int Foldcomp::writeString(std::string& output) {
         output.append(buffer, sizeof(buffer));
     }
 
-    appendBytes(output, this->sideChainAnglesDiscretized);
+    appendByteVector(output, this->sideChainAnglesDiscretized);
     appendBytes(output, this->tempFactorsDisc.min);
     appendBytes(output, this->tempFactorsDisc.cont_f);
-    appendBytes(output, this->tempFactorsDiscretized);
+    appendByteVector(output, this->tempFactorsDiscretized);
     return flag;
 }
 
