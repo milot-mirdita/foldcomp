@@ -28,7 +28,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <map>
 #include <string>
 #include <vector>
@@ -379,8 +378,8 @@ public:
     int preprocess(const tcb::span<AtomCoordinate>& atoms);
     std::vector<BackboneChain> compress(const tcb::span<AtomCoordinate>& atoms);
     int decompress(std::vector<AtomCoordinate>& atoms);
-    int read(std::istream & filename);
-    int writeStream(std::ostream& os);
+    int read(const char* data, size_t size);
+    int writeString(std::string& output);
     int write(std::string filename);
     // Read & write for tar files
 #ifdef FOLDCOMP_EXECUTABLE
@@ -395,8 +394,6 @@ public:
     size_t getSize();
     // methods for getting plddt (tempFactors) or amino acid sequence
     int continuizeTempFactors();
-    int writeFASTALike(std::ostream& os, const std::string& data);
-    int writeTSV(std::ostream& os, const std::string& data);
     int writeTorsionAngles(std::string filename);
     int extract(std::string& data, int type, int digits);
 

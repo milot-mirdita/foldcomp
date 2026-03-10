@@ -2,6 +2,7 @@
 #include "atom_coordinate.h"
 #include "database_reader.h"
 #include "foldcomp.h"
+#include "structure_codec.h"
 #include "structure_reader.h"
 #include "utility.h"
 
@@ -36,18 +37,6 @@ namespace fs = std::filesystem;
 Summary summarize(const std::vector<AtomCoordinate>& atoms);
 std::map<ResidueKey, ResidueStats> groupResidues(const std::vector<AtomCoordinate>& atoms);
 
-static constexpr uint8_t FOLDCOMP_FORMAT_VERSION_CONTAINER = 2;
-static constexpr uint8_t FOLDCOMP_FORMAT_FLAG_CONTAINER = 1;
-static constexpr uint8_t CONTAINER_FRAGMENT_KIND_FCZ = 0;
-static constexpr uint8_t CONTAINER_FRAGMENT_KIND_RAW_ATOMS = 2;
-
-struct ContainerFragment {
-    uint8_t kind = CONTAINER_FRAGMENT_KIND_FCZ;
-    int16_t model = 1;
-    std::string chain;
-    std::string payload;
-};
-
 enum class RawReason {
     NonProtein = 0,
     CaOnlyResidue,
@@ -80,141 +69,9 @@ const char* rawReasonName(RawReason reason) {
     return "unknown";
 }
 
-template <typename T>
-bool readBinaryValue(const char* data, size_t size, size_t& offset, T& out) {
-    if (offset + sizeof(T) > size) {
-        return false;
-    }
-    memcpy(&out, data + offset, sizeof(T));
-    offset += sizeof(T);
-    return true;
-}
-
-bool hasFoldcompMagic(const char* data, size_t size) {
-    if (size < MAGICNUMBER_LENGTH) {
-        return false;
-    }
-    return memcmp(data, MAGICNUMBER, MAGICNUMBER_LENGTH) == 0;
-}
-
-bool isContainerHeader(const CompressedFileHeader& header) {
-    bool supportedVersion = header.version == 1 || header.version == FOLDCOMP_FORMAT_VERSION_CONTAINER;
-    return supportedVersion &&
-           (header.flags & FOLDCOMP_FORMAT_FLAG_CONTAINER) != 0 &&
-           header.nResidue == 0 &&
-           header.nAtom == 0;
-}
-
-bool readContainer(
-    const char* data, size_t size, std::string& title,
-    std::vector<ContainerFragment>& fragments
-) {
-    title.clear();
-    fragments.clear();
-    if (!hasFoldcompMagic(data, size)) {
-        return false;
-    }
-    if (size < MAGICNUMBER_LENGTH + sizeof(CompressedFileHeader) + sizeof(uint32_t)) {
-        return false;
-    }
-
-    size_t offset = MAGICNUMBER_LENGTH;
-    CompressedFileHeader header = {};
-    memcpy(&header, data + offset, sizeof(header));
-    offset += sizeof(header);
-    if (!isContainerHeader(header)) {
-        return false;
-    }
-
-    uint32_t nFragments = 0;
-    if (!readBinaryValue(data, size, offset, nFragments)) {
-        return false;
-    }
-    if (offset + header.lenTitle > size) {
-        return false;
-    }
-    if (header.lenTitle > 0) {
-        title.assign(data + offset, data + offset + header.lenTitle);
-        offset += header.lenTitle;
-    }
-
-    fragments.reserve(nFragments);
-    for (uint32_t i = 0; i < nFragments; i++) {
-        ContainerFragment fragment;
-        uint8_t chainLen = 0;
-        uint32_t payloadSize = 0;
-        if (header.version >= FOLDCOMP_FORMAT_VERSION_CONTAINER) {
-            if (!readBinaryValue(data, size, offset, fragment.kind)) {
-                return false;
-            }
-        }
-        if (!readBinaryValue(data, size, offset, fragment.model) ||
-            !readBinaryValue(data, size, offset, chainLen)) {
-            return false;
-        }
-        if (offset + chainLen > size) {
-            return false;
-        }
-        if (chainLen > 0) {
-            fragment.chain.assign(data + offset, data + offset + chainLen);
-            offset += chainLen;
-        }
-        if (!readBinaryValue(data, size, offset, payloadSize)) {
-            return false;
-        }
-        if (offset + payloadSize > size) {
-            return false;
-        }
-        fragment.payload.assign(data + offset, data + offset + payloadSize);
-        offset += payloadSize;
-        fragments.push_back(std::move(fragment));
-    }
-    return true;
-}
-
 bool decodeEntryToAtoms(const char* dataBuffer, size_t size, std::vector<AtomCoordinate>& atoms) {
-    atoms.clear();
-    std::string containerTitle;
-    std::vector<ContainerFragment> containerFragments;
-    bool isContainer = readContainer(dataBuffer, size, containerTitle, containerFragments);
-    if (isContainer) {
-        for (const auto& fragment : containerFragments) {
-            std::vector<AtomCoordinate> fragmentAtoms;
-            if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_ATOMS) {
-                if (!deserializeAtomCoordinates(
-                        fragment.payload.data(), fragment.payload.size(), fragmentAtoms)) {
-                    return false;
-                }
-            } else if (fragment.kind == CONTAINER_FRAGMENT_KIND_FCZ) {
-                Foldcomp compRes;
-                std::istringstream fragmentInput(fragment.payload);
-                int flag = compRes.read(fragmentInput);
-                if (flag != 0) {
-                    return false;
-                }
-                flag = compRes.decompress(fragmentAtoms);
-                if (flag != 0) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-            for (auto& atom : fragmentAtoms) {
-                atom.model = fragment.model;
-                atom.chain = fragment.chain;
-                atoms.push_back(atom);
-            }
-        }
-        return true;
-    }
-
-    Foldcomp compRes;
-    std::istringstream input(std::string(dataBuffer, size));
-    int flag = compRes.read(input);
-    if (flag != 0) {
-        return false;
-    }
-    return compRes.decompress(atoms) == 0;
+    std::string title;
+    return decodeStructureToAtoms(dataBuffer, size, false, title, atoms);
 }
 
 std::string sourcePathToDbKey(const std::string& path) {
@@ -783,8 +640,7 @@ int commandContainerReport(const std::string& encodedPath) {
     bool isContainer = readContainer(data.data(), data.size(), title, fragments);
     if (!isContainer) {
         Foldcomp compRes;
-        std::istringstream singleInput(data);
-        if (compRes.read(singleInput) != 0) {
+        if (compRes.read(data.data(), data.size()) != 0) {
             std::cerr << "[Error] Failed to read FCZ " << encodedPath << "\n";
             return 1;
         }
@@ -835,8 +691,7 @@ int commandContainerReport(const std::string& encodedPath) {
         }
 
         Foldcomp compRes;
-        std::istringstream fragmentInput(fragment.payload);
-        if (compRes.read(fragmentInput) != 0) {
+        if (compRes.read(fragment.payload.data(), fragment.payload.size()) != 0) {
             std::cout << " read_error=1\n";
             continue;
         }

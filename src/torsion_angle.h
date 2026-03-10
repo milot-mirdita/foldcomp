@@ -14,7 +14,6 @@
 #pragma once
 #include "float3d.h"
 
-#include <iosfwd>
 #include <string> // IWYU pragma: keep
 #include <vector>
 

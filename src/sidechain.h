@@ -12,7 +12,6 @@
  * Copyright © 2021 Hyunbin Kim, All rights reserved
  */
 #pragma once
-#include <iosfwd>
 #include <map>
 #include <string> // IWYU pragma: keep
 #include <vector>

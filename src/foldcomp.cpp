@@ -21,7 +21,30 @@
 
 #include <algorithm>
 #include <bitset>
+#include <cstdio>
 #include <utility>
+
+namespace {
+
+template <typename T>
+void appendBytes(std::string& output, const T& value) {
+    size_t offset = output.size();
+    output.resize(offset + sizeof(T));
+    memcpy(output.data() + offset, &value, sizeof(T));
+}
+
+template <typename T>
+void appendBytes(std::string& output, const std::vector<T>& values) {
+    if (values.empty()) {
+        return;
+    }
+    size_t bytes = values.size() * sizeof(T);
+    size_t offset = output.size();
+    output.resize(offset + bytes);
+    memcpy(output.data() + offset, values.data(), bytes);
+}
+
+}
 
 // Changed at 2022-04-14 16:02:30
 /**
@@ -269,26 +292,36 @@ int reconstructBackboneReverse(
     std::vector<AtomCoordinate>& atom, std::vector< std::vector<float> >& lastCoords,
     std::vector<float>& torsion_angles, Nerf& nerf
 ) {
-    std::vector<AtomCoordinate> atomBack = atom;
+    std::vector<AtomCoordinate> forwardAtom = atom;
     // Last atoms
-    atomBack[atomBack.size() - 3].coordinate.x = lastCoords[0][0];
-    atomBack[atomBack.size() - 3].coordinate.y = lastCoords[0][1];
-    atomBack[atomBack.size() - 3].coordinate.z = lastCoords[0][2];
-    atomBack[atomBack.size() - 2].coordinate.x = lastCoords[1][0];
-    atomBack[atomBack.size() - 2].coordinate.y = lastCoords[1][1];
-    atomBack[atomBack.size() - 2].coordinate.z = lastCoords[1][2];
-    atomBack[atomBack.size() - 1].coordinate.x = lastCoords[2][0];
-    atomBack[atomBack.size() - 1].coordinate.y = lastCoords[2][1];
-    atomBack[atomBack.size() - 1].coordinate.z = lastCoords[2][2];
+    atom[atom.size() - 3].coordinate.x = lastCoords[0][0];
+    atom[atom.size() - 3].coordinate.y = lastCoords[0][1];
+    atom[atom.size() - 3].coordinate.z = lastCoords[0][2];
+    atom[atom.size() - 2].coordinate.x = lastCoords[1][0];
+    atom[atom.size() - 2].coordinate.y = lastCoords[1][1];
+    atom[atom.size() - 2].coordinate.z = lastCoords[1][2];
+    atom[atom.size() - 1].coordinate.x = lastCoords[2][0];
+    atom[atom.size() - 1].coordinate.y = lastCoords[2][1];
+    atom[atom.size() - 1].coordinate.z = lastCoords[2][2];
 
-    std::vector<float> bond_angles = nerf.getBondAngles(atom);
+    std::vector<float> bond_angles = nerf.getBondAngles(forwardAtom);
 
     std::vector<AtomCoordinate> atomBackward = nerf.reconstructWithReversed(
-        atomBack, torsion_angles, bond_angles
+        atom, torsion_angles, bond_angles
     );
 
-    atomBack = weightedAverage(atom, atomBackward);
-    atom = atomBack;
+    int total = atom.size();
+    for (int i = 0; i < total; i++) {
+        atom[i].coordinate.x =
+            ((forwardAtom[i].coordinate.x * static_cast<float>(total - i)) +
+             (atomBackward[i].coordinate.x * static_cast<float>(i))) / static_cast<float>(total);
+        atom[i].coordinate.y =
+            ((forwardAtom[i].coordinate.y * static_cast<float>(total - i)) +
+             (atomBackward[i].coordinate.y * static_cast<float>(i))) / static_cast<float>(total);
+        atom[i].coordinate.z =
+            ((forwardAtom[i].coordinate.z * static_cast<float>(total - i)) +
+             (atomBackward[i].coordinate.z * static_cast<float>(i))) / static_cast<float>(total);
+    }
     return 0;
 }
 
@@ -503,12 +536,13 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
     // Discretize
     // Keep only residues with complete backbone (N/CA/C).
     std::vector<AtomCoordinate> encodableAtoms;
-    std::vector<std::vector<AtomCoordinate>> residueAtoms = splitAtomByResidue(atoms);
-    for (const auto& residue : residueAtoms) {
+    std::vector<std::pair<size_t, size_t>> residueRanges = splitResidueRanges(atoms);
+    for (const auto& residue : residueRanges) {
         bool hasN = false;
         bool hasCA = false;
         bool hasC = false;
-        for (const auto& atom : residue) {
+        for (size_t i = residue.first; i < residue.second; i++) {
+            const auto& atom = atoms[i];
             if (atom.atom == "N") {
                 hasN = true;
             } else if (atom.atom == "CA") {
@@ -518,7 +552,7 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
             }
         }
         if (hasN && hasCA && hasC) {
-            encodableAtoms.insert(encodableAtoms.end(), residue.begin(), residue.end());
+            encodableAtoms.insert(encodableAtoms.end(), atoms.begin() + residue.first, atoms.begin() + residue.second);
         }
     }
     if (encodableAtoms.empty()) {
@@ -642,6 +676,7 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
 
 std::vector<BackboneChain> Foldcomp::compress(const tcb::span<AtomCoordinate>& atoms) {
     std::vector<BackboneChain> output;
+    this->residues.clear();
     // TODO: convert the atom coordinate vector into a vector of compressed residue
     // CURRENT VERSION - 2022-01-10 15:34:21
     // IGNORE BREAKS
@@ -653,6 +688,8 @@ std::vector<BackboneChain> Foldcomp::compress(const tcb::span<AtomCoordinate>& a
     if (atoms.size() < 3 || this->backbone.size() < 3 || this->nResidue <= 0) {
         return output;
     }
+    output.reserve(static_cast<size_t>(this->nResidue));
+    this->residues.reserve(static_cast<size_t>(this->nResidue));
     this->prevAtoms = {this->backbone[0], this->backbone[1], this->backbone[2]};
 
     AtomCoordinate currN;
@@ -880,6 +917,28 @@ std::vector<float> Foldcomp::checkTorsionReconstruction() {
 int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
     // 2022-11-15 11:47:49 - Removed defining new vectors for TAs & BAs
     int success;
+    atom.clear();
+    this->residues.clear();
+    this->residueThreeLetter.clear();
+    this->backboneTorsionAngles.clear();
+    this->backboneBondAngles.clear();
+    this->sideChainAnglesPerResidue.clear();
+    this->tempFactors.clear();
+    this->phi.clear();
+    this->psi.clear();
+    this->omega.clear();
+    this->n_ca_c_angle.clear();
+    this->ca_c_n_angle.clear();
+    this->c_n_ca_angle.clear();
+    this->residues.reserve(this->compressedBackBone.size());
+    this->residueThreeLetter.reserve(this->compressedBackBone.size());
+    if (this->compressedBackBone.size() > 1) {
+        this->backboneTorsionAngles.reserve((this->compressedBackBone.size() - 1) * 3);
+    }
+    this->backboneBondAngles.reserve(this->compressedBackBone.size() * 3);
+    this->sideChainAnglesPerResidue.reserve(this->compressedBackBone.size());
+    this->tempFactors.reserve(this->compressedBackBone.size());
+    atom.reserve(static_cast<size_t>(this->header.nAtom) + (this->hasOXT ? 1u : 0u));
 
     // Continuize torsion angles
     this->phi = this->phiDisc.continuize(this->phiDiscretized);
@@ -958,42 +1017,45 @@ int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
     }
 
     // Reconstruct sidechain
-    std::vector<std::vector<AtomCoordinate>> backBonePerResidue = splitAtomByResidue(atom);
+    std::vector<std::pair<size_t, size_t>> residueRanges = splitResidueRanges(atom);
     std::string currResidue = getThreeLetterCode(this->header.firstResidue);
-    std::vector<AtomCoordinate> fullResidue;
 
     success = this->_continuizeSideChainTorsionAngles(
         this->sideChainAnglesDiscretized, this->sideChainAnglesPerResidue
     );
 
-    for (size_t i = 0; i < backBonePerResidue.size(); i++) {
-        if (i != 0){
-            currResidue = backBonePerResidue[i][0].residue;
-        }
-        const auto aaIt = AAS.find(currResidue);
-        if (aaIt == AAS.end()) {
-            continue;
-        }
-        fullResidue = nerf.reconstructAminoAcid(
-            backBonePerResidue[i], this->sideChainAnglesPerResidue[i], aaIt->second
-        );
-        if (this->useAltAtomOrder) {
-            _reorderAtoms(fullResidue, aaIt->second);
-        }
-        backBonePerResidue[i] = fullResidue;
-    }
-    // Flatten backBonePerResidue & set tempFactor
-    atom.clear();
     // Prepare tempFactor
     std::vector<float> tempFactors = this->tempFactorsDisc.continuize(this->tempFactorsDiscretized);
     this->tempFactors = tempFactors;
-    // Iterate over each residue
-    for (size_t i = 0; i < backBonePerResidue.size(); i++) {
-        for (size_t j = 0; j < backBonePerResidue[i].size(); j++) {
-            backBonePerResidue[i][j].tempFactor = tempFactors[i];
-            atom.push_back(backBonePerResidue[i][j]);
+
+    std::vector<AtomCoordinate> rebuiltAtoms;
+    rebuiltAtoms.reserve(static_cast<size_t>(this->header.nAtom) + (this->hasOXT ? 1u : 0u));
+    for (size_t i = 0; i < residueRanges.size(); i++) {
+        const auto& residueRange = residueRanges[i];
+        tcb::span<const AtomCoordinate> backboneResidue(
+            atom.data() + residueRange.first, residueRange.second - residueRange.first
+        );
+        if (i != 0) {
+            currResidue = backboneResidue[0].residue;
+        }
+        const auto aaIt = AAS.find(currResidue);
+        std::vector<AtomCoordinate> fullResidue;
+        if (aaIt == AAS.end()) {
+            fullResidue.assign(backboneResidue.begin(), backboneResidue.end());
+        } else {
+            fullResidue = nerf.reconstructAminoAcid(
+                backboneResidue, this->sideChainAnglesPerResidue[i], aaIt->second
+            );
+            if (this->useAltAtomOrder) {
+                _reorderAtoms(fullResidue, aaIt->second);
+            }
+        }
+        for (AtomCoordinate& residueAtom : fullResidue) {
+            residueAtom.tempFactor = tempFactors[i];
+            rebuiltAtoms.push_back(std::move(residueAtom));
         }
     }
+    atom = std::move(rebuiltAtoms);
     // Reindex atom index of atom
     if (this->hasOXT) {
         // Set OXT tempFactor
@@ -1005,42 +1067,62 @@ int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
     return success;
 }
 
-int Foldcomp::read(std::istream & file) {
-    int success;
-    // Open file in reading binary mode
+int Foldcomp::read(const char* data, size_t size) {
+    auto readBytes = [&](void* dst, size_t count, size_t& offset) -> bool {
+        if (offset + count > size) {
+            return false;
+        }
+        memcpy(dst, data + offset, count);
+        offset += count;
+        return true;
+    };
 
-    // Check the file starts with magic number
+    this->anchorCoordinates.clear();
+    this->lastAtomCoordinates.clear();
+    this->compressedBackBone.clear();
+    this->sideChainAnglesDiscretized.clear();
+    this->tempFactorsDiscretized.clear();
+
+    size_t offset = 0;
     char mNum[MAGICNUMBER_LENGTH];
-    file.read(mNum, MAGICNUMBER_LENGTH);
+    if (!readBytes(mNum, MAGICNUMBER_LENGTH, offset)) {
+        return -1;
+    }
     for (int i = 0; i < MAGICNUMBER_LENGTH; i++) {
         if (mNum[i] != MAGICNUMBER[i]) {
             return -1;
         }
     }
-    // Read the header
-    file.read(reinterpret_cast<char*>(&this->header), sizeof(this->header));
+
+    if (!readBytes(&this->header, sizeof(this->header), offset)) {
+        return -1;
+    }
     this->read_header(this->header);
-    // Read anchorIndices
     this->anchorIndices.resize(this->nAllAnchor);
-    // Read int vector
-    file.read(reinterpret_cast<char*>(&this->anchorIndices[0]), sizeof(int) * this->nAllAnchor);
-    // Read the title
-    this->strTitle = std::string(this->header.lenTitle, '\0');
-    file.read(&this->strTitle[0], sizeof(char) * this->header.lenTitle);
+    if (!this->anchorIndices.empty() &&
+        !readBytes(this->anchorIndices.data(), sizeof(int) * this->nAllAnchor, offset)) {
+        return -1;
+    }
+    this->strTitle.assign(this->header.lenTitle, '\0');
+    if (this->header.lenTitle > 0 &&
+        !readBytes(this->strTitle.data(), sizeof(char) * this->header.lenTitle, offset)) {
+        return -1;
+    }
 
-    // Read the prev atoms
-    // In the file, only xyz coordinates are stored
-    // So, we need to reconstruct the atomcoordinate from the xyz coordinates & the information from the header
     float prevAtomCoords[9];
-    file.read(reinterpret_cast<char*>(prevAtomCoords), sizeof(prevAtomCoords));
+    if (!readBytes(prevAtomCoords, sizeof(prevAtomCoords), offset)) {
+        return -1;
+    }
 
-    // ANCHOR ATOMS
     if (this->header.nAnchor > 2) {
         float innerAnchorCoords[3];
         for (int i = 0; i < (this->header.nAnchor - 2); i++) {
             std::vector<std::vector<float>> innerAnchorCoord;
+            innerAnchorCoord.reserve(3);
             for (int j = 0; j < 3; j++) {
-                file.read(reinterpret_cast<char*>(innerAnchorCoords), sizeof(innerAnchorCoords));
+                if (!readBytes(innerAnchorCoords, sizeof(innerAnchorCoords), offset)) {
+                    return -1;
+                }
                 innerAnchorCoord.push_back({
                     innerAnchorCoords[0],
                     innerAnchorCoords[1],
@@ -1051,17 +1133,22 @@ int Foldcomp::read(std::istream & file) {
         }
     }
 
-    // LAST ATOMS
     float lastAtomCoords[9];
-    file.read(reinterpret_cast<char*>(lastAtomCoords), sizeof(lastAtomCoords));
+    if (!readBytes(lastAtomCoords, sizeof(lastAtomCoords), offset)) {
+        return -1;
+    }
     for (int i = 0; i < 3; i++) {
-        this->lastAtomCoordinates.push_back({ lastAtomCoords[i*3], lastAtomCoords[i*3 + 1], lastAtomCoords[i*3+ 2] });
+        this->lastAtomCoordinates.push_back({ lastAtomCoords[i*3], lastAtomCoords[i*3 + 1], lastAtomCoords[i*3 + 2] });
     }
     this->anchorCoordinates.push_back(this->lastAtomCoordinates);
 
-    file.read(&this->hasOXT, sizeof(char));
+    if (!readBytes(&this->hasOXT, sizeof(char), offset)) {
+        return -1;
+    }
     float oxtCoords[3];
-    file.read(reinterpret_cast<char*>(oxtCoords), sizeof(oxtCoords));
+    if (!readBytes(oxtCoords, sizeof(oxtCoords), offset)) {
+        return -1;
+    }
     this->OXT_coords = { oxtCoords[0], oxtCoords[1], oxtCoords[2] };
     int lastResidueIndex = static_cast<int>(this->header.idxResidue + this->header.nResidue - 1);
     int lastAtomIndex = static_cast<int>(this->header.idxAtom + this->header.nAtom - 1);
@@ -1070,92 +1157,73 @@ int Foldcomp::read(std::istream & file) {
         lastAtomIndex, lastResidueIndex, this->OXT_coords
     );
 
-    // Read sidechain discretizers
-    // file.read(reinterpret_cast<char*>(&this->sideChainDisc), sizeof(SideChainDiscretizers));time
-
-    // Read the array of backbone bytes
-    // Read 8 bytes at a time
-    // Converted data will be saved at this->compressedBackBone
-    // if this->compressedBackBone is not empty, then it will be overwritten
-    // check if compressedBackBone is empty
-    if (this->compressedBackBone.size() == 0) {
-        this->compressedBackBone.resize(this->header.nResidue);
-    } else {
-        this->compressedBackBone.clear();
-        this->compressedBackBone.resize(this->header.nResidue);
-    }
-    char* buffer = new char[8];
+    this->compressedBackBone.resize(this->header.nResidue);
+    char buffer[8];
     for (int i = 0; i < this->header.nResidue; i++) {
-        file.read(buffer, 8);
-        // Convert buffer to compressedBackBone using convertBytesToBackboneChain
+        if (!readBytes(buffer, sizeof(buffer), offset)) {
+            return -1;
+        }
         this->compressedBackBone[i] = convertBytesToBackboneChain(buffer);
     }
-    delete[] buffer;
 
-    // Read sidechain
-    int encodedSideChainSize = this->header.nSideChainTorsion;
-    if (encodedSideChainSize % 2 == 1) {
-        encodedSideChainSize++;
+    std::vector<unsigned char> encodedSideChain(this->header.nSideChainTorsion);
+    if (this->header.nSideChainTorsion > 0 &&
+        !readBytes(encodedSideChain.data(), this->header.nSideChainTorsion, offset)) {
+        return -1;
     }
-    encodedSideChainSize /= 2;
-    unsigned char* encodedSideChain = new unsigned char[this->header.nSideChainTorsion];
-    // file.read(reinterpret_cast<char*>(encodedSideChain), sizeof(encodedSideChain));
-    // Decode sidechain
-    // success = decodeSideChainTorsionVector(
-    //     encodedSideChain, this->header.nSideChainTorsion,
-    //     this->sideChainAnglesDiscretized
-    // );
-    file.read(reinterpret_cast<char*>(encodedSideChain), this->header.nSideChainTorsion);
-    // Read char array to unsigned int vector sideChainAnglesDiscretized
-    unsigned int temp;
+    this->sideChainAnglesDiscretized.reserve(this->header.nSideChainTorsion);
     for (size_t i = 0; i < this->header.nSideChainTorsion; i++) {
-        // Convert char to unsigned int
-        temp = encodedSideChain[i];
-        this->sideChainAnglesDiscretized.push_back(temp);
+        this->sideChainAnglesDiscretized.push_back(static_cast<unsigned int>(encodedSideChain[i]));
     }
-    delete[] encodedSideChain;
 
-    // Read temperature factor
-    // Read discretizer for temperature factor
-    file.read(reinterpret_cast<char*>(&this->tempFactorsDisc.min), sizeof(float));
-    file.read(reinterpret_cast<char*>(&this->tempFactorsDisc.cont_f), sizeof(float));
-
-    unsigned char* encodedTempFactors = new unsigned char[this->header.nResidue];
-    file.read(reinterpret_cast<char*>(encodedTempFactors), this->header.nResidue);
-
-    unsigned int tempFactor;
+    if (!readBytes(&this->tempFactorsDisc.min, sizeof(float), offset) ||
+        !readBytes(&this->tempFactorsDisc.cont_f, sizeof(float), offset)) {
+        return -1;
+    }
+    std::vector<unsigned char> encodedTempFactors(this->header.nResidue);
+    if (this->header.nResidue > 0 &&
+        !readBytes(encodedTempFactors.data(), this->header.nResidue, offset)) {
+        return -1;
+    }
+    this->tempFactorsDiscretized.reserve(this->header.nResidue);
     for (int i = 0; i < this->header.nResidue; i++) {
-        tempFactor = (unsigned int)encodedTempFactors[i];
-        this->tempFactorsDiscretized.push_back(tempFactor);
+        this->tempFactorsDiscretized.push_back(static_cast<unsigned int>(encodedTempFactors[i]));
     }
-    delete[] encodedTempFactors;
 
-    success = _restoreAtomCoordinate(prevAtomCoords);
+    int success = _restoreAtomCoordinate(prevAtomCoords);
     if (success != 0) {
         return -2;
     }
     for (int i = 0; i < 6; i++) {
         success = _restoreDiscretizer(i);
+        if (success != 0) {
+            return success;
+        }
     }
-    // Close file
     return success;
 }
 
-int Foldcomp::writeStream(std::ostream& os) {
+int Foldcomp::writeString(std::string& output) {
     int flag = 0;
-    // Write magic number
-    os.write(MAGICNUMBER, MAGICNUMBER_LENGTH);
-    // Write header
-    os.write((char*)&this->header, sizeof(CompressedFileHeader));
-    // Write anchorIndices
-    for (size_t i = 0; i < this->anchorIndices.size(); i++) {
-        os.write((char*)&this->anchorIndices[i], sizeof(int));
-    }
-    // Write title
-    os.write(this->strTitle.c_str(), this->strTitle.length());
+    output.clear();
+    size_t totalSize = MAGICNUMBER_LENGTH +
+                       sizeof(CompressedFileHeader) +
+                       this->anchorIndices.size() * sizeof(int) +
+                       this->strTitle.size() +
+                       this->anchorAtoms.size() * 9 * sizeof(float) +
+                       sizeof(char) +
+                       3 * sizeof(float) +
+                       this->compressedBackBone.size() * 8 +
+                       this->sideChainAnglesDiscretized.size() +
+                       2 * sizeof(float) +
+                       this->tempFactorsDiscretized.size();
+    output.reserve(totalSize);
 
-    // 2022-08-08 19:15:30 - Changed to write all anchor atoms
-    // TODO: NEED TO BE CHECKED
+    output.append(MAGICNUMBER, MAGICNUMBER_LENGTH);
+    appendBytes(output, this->header);
+    appendBytes(output, this->anchorIndices);
+    output.append(this->strTitle);
+
     for (const auto& anchors : this->anchorAtoms) {
         for (int i = 0; i < 3; i++) {
             float3d coord;
@@ -1166,69 +1234,44 @@ int Foldcomp::writeStream(std::ostream& os) {
             } else {
                 coord = {0.0f, 0.0f, 0.0f};
             }
-            os.write((char*)&coord.x, sizeof(float));
-            os.write((char*)&coord.y, sizeof(float));
-            os.write((char*)&coord.z, sizeof(float));
+            appendBytes(output, coord.x);
+            appendBytes(output, coord.y);
+            appendBytes(output, coord.z);
         }
     }
 
-    os.write(&this->hasOXT, sizeof(char));
-    os.write((char*)&this->OXT_coords.x, sizeof(float));
-    os.write((char*)&this->OXT_coords.y, sizeof(float));
-    os.write((char*)&this->OXT_coords.z, sizeof(float));
+    output.push_back(this->hasOXT);
+    appendBytes(output, this->OXT_coords.x);
+    appendBytes(output, this->OXT_coords.y);
+    appendBytes(output, this->OXT_coords.z);
 
-    // END OF BACKBONE METADATA
-    // // Write sidechain discretizers
-    // os.write((char*)&this->sideChainDisc, sizeof(SideChainDiscretizers));
+    char buffer[8];
+    for (const auto& residue : this->compressedBackBone) {
+        BackboneChain tmp = residue;
+        flag = convertBackboneChainToBytes(tmp, buffer);
+        output.append(buffer, sizeof(buffer));
+    }
 
-    // Write the compressed backbone
-    char* buffer = new char[8];
-    for (size_t i = 0; i < this->compressedBackBone.size(); i++) {
-        flag = convertBackboneChainToBytes(this->compressedBackBone[i], buffer);
-        os.write(buffer, 8);
-    }
-    delete[] buffer;
-    // 2022-06-07 18:44:09 - Check memory leak
-    // Write side chain torsion angles
-    int encodedSideChainSize = this->nSideChainTorsion;
-    if (encodedSideChainSize % 2 == 1) {
-        encodedSideChainSize++;
-    }
-    encodedSideChainSize /= 2;
-    // char* charSideChainTorsion = encodeSideChainTorsionVector(this->sideChainAnglesDiscretized);
-    // os.write(charSideChainTorsion, encodedSideChainSize);
-    // TODO: TESTING
-    // Convert unsigned int to char array
-    unsigned char* charSideChainTorsion = new unsigned char[this->nSideChainTorsion];
-    // Get array of unsigned int from sideChainAnglesDiscretized and convert to char array
-    for (int i = 0; i < this->nSideChainTorsion; i++) {
-        // convert unsigned int to char
-        charSideChainTorsion[i] = (unsigned char)this->sideChainAnglesDiscretized[i];
-    }
-    os.write((char*)charSideChainTorsion, this->sideChainAnglesDiscretized.size());
-    delete[] charSideChainTorsion;
-
-    // Write temperature factors
-    // Disc
-    os.write((char*)&this->tempFactorsDisc.min, sizeof(float));
-    os.write((char*)&this->tempFactorsDisc.cont_f, sizeof(float));
-
-    unsigned char* charTempFactors = new unsigned char[this->header.nResidue];
-    for (int i = 0; i < this->header.nResidue; i++) {
-        charTempFactors[i] = (unsigned char)this->tempFactorsDiscretized[i];
-    }
-    os.write((char*)charTempFactors, this->tempFactorsDiscretized.size());
-    delete[] charTempFactors;
+    appendBytes(output, this->sideChainAnglesDiscretized);
+    appendBytes(output, this->tempFactorsDisc.min);
+    appendBytes(output, this->tempFactorsDisc.cont_f);
+    appendBytes(output, this->tempFactorsDiscretized);
     return flag;
 }
 
 int Foldcomp::write(std::string filename) {
-    // Open in binary & writing mode
-    std::ofstream outfile(filename, std::ios::out | std::ios::binary);
-    if (!outfile) {
+    std::string encoded;
+    int flag = writeString(encoded);
+    if (flag != 0) {
+        return flag;
+    }
+    FILE* outfile = fopen(filename.c_str(), "wb");
+    if (outfile == nullptr) {
         return -1;
     }
-    return writeStream(outfile);
+    size_t written = fwrite(encoded.data(), 1, encoded.size(), outfile);
+    fclose(outfile);
+    return written == encoded.size() ? 0 : -1;
 }
 
 #ifdef FOLDCOMP_EXECUTABLE
@@ -1342,34 +1385,17 @@ int Foldcomp::continuizeTempFactors() {
     return 0;
 }
 
-int Foldcomp::writeFASTALike(std::ostream& os, const std::string& data) {
-    // Output format
-    // >title
-    // 95461729... 889 // plddt of all residues converted to 1 decimal place or
-    // MKLLSKPR... YVK // amino acid sequence
-    // Write title
-    os << ">" << this->strTitle << "\n" << data << "\n";
-    return 0;
-}
-
-int Foldcomp::writeTSV(std::ostream& os, const std::string& data) {
-    // Write title
-    os << this->strTitle << "\t" << this->nResidue << "\t" << data << "\n";
-    return 0;
-}   
-
 int Foldcomp::writeTorsionAngles(std::string filename) {
-    int flag = 0;
-    std::ofstream outfile(filename, std::ios::out);
-    // Write header
-    outfile << "index,phi,psi,omega" << std::endl;
-    // Write backbone torsion angles
-    for (size_t i = 0; i < this->phi.size(); i++) {
-        outfile << i << "," << this->phi[i] << "," << this->psi[i] << "," << this->omega[i] << std::endl;
+    FILE* outfile = fopen(filename.c_str(), "wb");
+    if (outfile == nullptr) {
+        return -1;
     }
-    // Done
-    outfile.close();
-    return flag;
+    fputs("index,phi,psi,omega\n", outfile);
+    for (size_t i = 0; i < this->phi.size(); i++) {
+        fprintf(outfile, "%zu,%f,%f,%f\n", i, this->phi[i], this->psi[i], this->omega[i]);
+    }
+    fclose(outfile);
+    return 0;
 }
 
 /**
@@ -1575,8 +1601,7 @@ void Foldcomp::print(int length) {
 
 /*
 void Foldcomp::printSideChainTorsion(std::string filename) {
-    std::ofstream outfile;
-    outfile.open(filename);
+    FILE* outfile = fopen(filename.c_str(), "wb");
     //
     outfile << "ResidueInd,Residue,Type,Key,RawVal,DiscVal,DiscMin,DiscContF,ReconVal,Diff\n";
     int movingIndex = 0;

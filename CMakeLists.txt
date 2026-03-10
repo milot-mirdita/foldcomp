@@ -10,6 +10,7 @@ option(BUILD_PYTHON "Build python support" OFF)
 option(BUILD_WERROR "Build with warnings as errors" OFF)
 option(BUILD_IWYU "Build with include-what-you-use" OFF)
 option(GCS_SUPPORT "Enable Google Cloud Storage support" OFF)
+option(ENABLE_AUDIT "Build foldcomp_audit helper" OFF)
 
 include_directories(src)
 add_subdirectory(src)
@@ -85,12 +86,14 @@ else()
     add_subdirectory(lib/microtar)
     target_link_libraries(foldcomp PUBLIC microtar)
 
-    add_executable(foldcomp_audit
-        ${foldcomp_header_files}
-        ${foldcomp_source_files}
-        src/structure_reader.cpp
-        src/foldcomp_audit.cpp)
-    target_link_libraries(foldcomp_audit PUBLIC ZLIB::ZLIB)
+    if(ENABLE_AUDIT)
+        add_executable(foldcomp_audit
+            ${foldcomp_header_files}
+            ${foldcomp_source_files}
+            src/structure_reader.cpp
+            src/foldcomp_audit.cpp)
+        target_link_libraries(foldcomp_audit PUBLIC ZLIB::ZLIB)
+    endif()
 
     if(GCS_SUPPORT)
         find_package(google_cloud_cpp_storage REQUIRED)

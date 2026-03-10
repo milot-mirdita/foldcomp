@@ -16,7 +16,6 @@
 #include "tcbspan.h"
 
 #include <cstdint>
-#include <fstream>
 #include <string>
 #include <vector>
 
@@ -83,13 +82,17 @@ std::vector<AtomCoordinate> weightedAverage(
 );
 
 void writeAtomCoordinatesToPDB(
-    std::vector<AtomCoordinate>& atoms, std::string title, std::ostream& pdb_path
+    std::vector<AtomCoordinate>& atoms, const std::string& title, std::string& output
 );
 int writeAtomCoordinatesToPDBFile(
-    std::vector<AtomCoordinate>& atoms, std::string title, std::string pdb_path
+    std::vector<AtomCoordinate>& atoms, const std::string& title, const std::string& pdb_path
 );
 
 std::vector<std::vector<AtomCoordinate>> splitAtomByResidue(
+    const tcb::span<AtomCoordinate>& atomCoordinates
+);
+
+std::vector<std::pair<size_t, size_t>> splitResidueRanges(
     const tcb::span<AtomCoordinate>& atomCoordinates
 );
 
@@ -98,6 +101,7 @@ std::vector<std::string> getResidueNameVector(
 );
 
 AtomCoordinate findFirstAtom(const std::vector<AtomCoordinate>& atoms, std::string atom_name);
+AtomCoordinate findFirstAtom(const tcb::span<const AtomCoordinate>& atoms, std::string atom_name);
 void setAtomIndexSequentially(std::vector<AtomCoordinate>& atoms, int start);
 void removeAlternativePosition(std::vector<AtomCoordinate>& atoms);
 
@@ -129,6 +133,11 @@ std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordina
 
 bool serializeAtomCoordinates(
     const std::vector<AtomCoordinate>& atoms,
+    std::string& output
+);
+
+bool serializeAtomCoordinates(
+    const tcb::span<const AtomCoordinate>& atoms,
     std::string& output
 );
 

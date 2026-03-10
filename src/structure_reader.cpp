@@ -15,7 +15,6 @@
 
 #include <stdexcept>
 #include <zlib.h>
-#include <iostream>
 // Gemmi
 #include "gemmi/gz.hpp"
 #include "gemmi/input.hpp"

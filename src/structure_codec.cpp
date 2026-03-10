@@ -1,0 +1,376 @@
+#include "structure_codec.h"
+
+#include "foldcomp.h"
+
+#include <algorithm>
+#include <cstring>
+#include <stdexcept>
+#include <set>
+
+namespace {
+
+template <typename T>
+bool readBinaryValue(const char* data, size_t size, size_t& offset, T& out) {
+    if (offset + sizeof(T) > size) {
+        return false;
+    }
+    memcpy(&out, data + offset, sizeof(T));
+    offset += sizeof(T);
+    return true;
+}
+
+template <typename T>
+void appendBytes(std::string& output, const T& value) {
+    size_t offset = output.size();
+    output.resize(offset + sizeof(T));
+    memcpy(output.data() + offset, &value, sizeof(T));
+}
+
+bool isContainerHeader(const CompressedFileHeader& header) {
+    bool supportedVersion = header.version == 1 || header.version == FOLDCOMP_FORMAT_VERSION_CONTAINER;
+    return supportedVersion &&
+           (header.flags & FOLDCOMP_FORMAT_FLAG_CONTAINER) != 0 &&
+           header.nResidue == 0 &&
+           header.nAtom == 0;
+}
+
+void appendTitleLines(const std::string& title, std::string& output) {
+    if (title.empty()) {
+        return;
+    }
+    const char* headerData = title.c_str();
+    size_t headerLen = title.length();
+    int remainingHeader = static_cast<int>(headerLen);
+    char buffer[128];
+    int written = snprintf(
+        buffer, sizeof(buffer), "TITLE     %.*s\n",
+        std::min(70, remainingHeader), headerData
+    );
+    if (written >= 0 && written < static_cast<int>(sizeof(buffer))) {
+        output.append(buffer, written);
+    }
+    remainingHeader -= 70;
+    int continuation = 2;
+    while (remainingHeader > 0) {
+        written = snprintf(
+            buffer, sizeof(buffer), "TITLE  % 3d%.*s\n",
+            continuation, std::min(70, remainingHeader),
+            headerData + (headerLen - remainingHeader)
+        );
+        if (written >= 0 && written < static_cast<int>(sizeof(buffer))) {
+            output.append(buffer, written);
+        }
+        remainingHeader -= 70;
+        continuation++;
+    }
+}
+
+std::string trim(const std::string& str, const std::string& whitespace = " \t") {
+    const std::string::size_type strBegin = str.find_first_not_of(whitespace);
+    if (strBegin == std::string::npos) {
+        return "";
+    }
+    const std::string::size_type strEnd = str.find_last_not_of(whitespace);
+    return str.substr(strBegin, strEnd - strBegin + 1);
+}
+
+}
+
+bool hasContainerMagic(const char* data, size_t size) {
+    if (size < CONTAINER_MAGIC_LENGTH) {
+        return false;
+    }
+    return memcmp(data, CONTAINER_MAGIC, CONTAINER_MAGIC_LENGTH) == 0;
+}
+
+bool parsePDBAtoms(
+    const char* data, size_t size, bool singleChainOnly,
+    std::vector<AtomCoordinate>& atoms, int& status
+) {
+    atoms.clear();
+    status = PARSE_PDB_OK;
+    size_t start = 0;
+    std::string chain;
+    while (start < size) {
+        size_t end = start;
+        while (end < size && data[end] != '\n') {
+            end++;
+        }
+        size_t len = end - start;
+        if (len >= 66 && memcmp(data + start, "ATOM", 4) == 0) {
+            std::string line(data + start, len);
+            std::string lineChain = line.substr(21, 1);
+            if (singleChainOnly) {
+                if (chain.empty()) {
+                    chain = lineChain;
+                } else if (lineChain != chain) {
+                    status = PARSE_PDB_MULTIPLE_CHAINS;
+                    return false;
+                }
+            } else {
+                chain = lineChain;
+            }
+            try {
+                atoms.emplace_back(
+                    trim(line.substr(12, 4)),
+                    trim(line.substr(17, 3)),
+                    chain,
+                    std::stoi(line.substr(6, 5)),
+                    std::stoi(line.substr(22, 4)),
+                    std::stof(line.substr(30, 8)),
+                    std::stof(line.substr(38, 8)),
+                    std::stof(line.substr(46, 8)),
+                    std::stof(line.substr(54, 6)),
+                    std::stof(line.substr(60, 6))
+                );
+            } catch (const std::exception&) {
+                status = PARSE_PDB_INVALID_FORMAT;
+                return false;
+            }
+        }
+        if (end == size) {
+            break;
+        }
+        start = end + 1;
+    }
+    if (atoms.empty()) {
+        status = PARSE_PDB_NO_ATOM;
+        return false;
+    }
+    return true;
+}
+
+bool writeContainerToString(
+    std::string& output, const std::string& title,
+    const std::vector<ContainerFragment>& fragments
+) {
+    output.clear();
+    size_t totalSize = CONTAINER_MAGIC_LENGTH + sizeof(CompressedFileHeader) + sizeof(uint32_t) + title.size();
+    for (const auto& fragment : fragments) {
+        totalSize += sizeof(fragment.kind) + sizeof(fragment.model) + sizeof(uint8_t) +
+                     std::min<size_t>(255, fragment.chain.size()) + sizeof(uint32_t) + fragment.payload.size();
+    }
+    output.reserve(totalSize);
+
+    CompressedFileHeader header = {};
+    header.version = FOLDCOMP_FORMAT_VERSION_CONTAINER;
+    header.flags = FOLDCOMP_FORMAT_FLAG_CONTAINER;
+    header.lenTitle = static_cast<uint32_t>(title.size());
+    uint32_t nFragments = static_cast<uint32_t>(fragments.size());
+
+    output.append(CONTAINER_MAGIC, CONTAINER_MAGIC_LENGTH);
+    appendBytes(output, header);
+    appendBytes(output, nFragments);
+    output.append(title);
+
+    for (const auto& fragment : fragments) {
+        uint8_t chainLen = static_cast<uint8_t>(std::min<size_t>(255, fragment.chain.size()));
+        uint32_t payloadSize = static_cast<uint32_t>(fragment.payload.size());
+        appendBytes(output, fragment.kind);
+        appendBytes(output, fragment.model);
+        appendBytes(output, chainLen);
+        if (chainLen > 0) {
+            output.append(fragment.chain.data(), chainLen);
+        }
+        appendBytes(output, payloadSize);
+        if (payloadSize > 0) {
+            output.append(fragment.payload);
+        }
+    }
+    return true;
+}
+
+bool readContainer(
+    const char* data, size_t size, std::string& title,
+    std::vector<ContainerFragment>& fragments
+) {
+    title.clear();
+    fragments.clear();
+    if (!hasContainerMagic(data, size)) {
+        return false;
+    }
+    if (size < CONTAINER_MAGIC_LENGTH + sizeof(CompressedFileHeader) + sizeof(uint32_t)) {
+        return false;
+    }
+
+    size_t offset = CONTAINER_MAGIC_LENGTH;
+    CompressedFileHeader header = {};
+    memcpy(&header, data + offset, sizeof(header));
+    offset += sizeof(header);
+    if (!isContainerHeader(header)) {
+        return false;
+    }
+
+    uint32_t nFragments = 0;
+    if (!readBinaryValue(data, size, offset, nFragments)) {
+        return false;
+    }
+
+    if (offset + header.lenTitle > size) {
+        return false;
+    }
+    if (header.lenTitle > 0) {
+        title.assign(data + offset, data + offset + header.lenTitle);
+        offset += header.lenTitle;
+    }
+
+    fragments.reserve(nFragments);
+    for (uint32_t i = 0; i < nFragments; i++) {
+        ContainerFragment fragment;
+        fragment.kind = CONTAINER_FRAGMENT_KIND_FCZ;
+        uint8_t chainLen = 0;
+        uint32_t payloadSize = 0;
+        if (header.version >= FOLDCOMP_FORMAT_VERSION_CONTAINER) {
+            if (!readBinaryValue(data, size, offset, fragment.kind)) {
+                return false;
+            }
+        }
+        if (!readBinaryValue(data, size, offset, fragment.model) ||
+            !readBinaryValue(data, size, offset, chainLen)) {
+            return false;
+        }
+        if (offset + chainLen > size) {
+            return false;
+        }
+        if (chainLen > 0) {
+            fragment.chain.assign(data + offset, data + offset + chainLen);
+            offset += chainLen;
+        }
+        if (!readBinaryValue(data, size, offset, payloadSize)) {
+            return false;
+        }
+        if (offset + payloadSize > size) {
+            return false;
+        }
+        fragment.payload.assign(data + offset, data + offset + payloadSize);
+        offset += payloadSize;
+        fragments.push_back(std::move(fragment));
+    }
+    return true;
+}
+
+void writeSegmentsToPDB(
+    const std::vector<DecompressedSegment>& segments,
+    const std::string& title,
+    std::string& output
+) {
+    output.clear();
+    if (segments.empty()) {
+        return;
+    }
+    appendTitleLines(title, output);
+    std::set<int> modelSet;
+    for (const auto& segment : segments) {
+        modelSet.insert(segment.model);
+    }
+    bool writeModels = modelSet.size() > 1;
+    int currModel = -1;
+    for (const auto& segment : segments) {
+        if (writeModels && segment.model != currModel) {
+            if (currModel != -1) {
+                output.append("ENDMDL\n");
+            }
+            char modelLine[32];
+            int written = snprintf(modelLine, sizeof(modelLine), "MODEL     %4d\n", segment.model);
+            output.append(modelLine, written);
+            currModel = segment.model;
+        }
+        std::vector<AtomCoordinate> atoms = segment.atoms;
+        std::string pdbPart;
+        writeAtomCoordinatesToPDB(atoms, "", pdbPart);
+        output.append(pdbPart);
+    }
+    if (writeModels) {
+        output.append("ENDMDL\n");
+    }
+}
+
+bool decodeStructureToSegments(
+    const char* data, size_t size, bool useAltOrder, std::string& title,
+    std::vector<DecompressedSegment>& segments
+) {
+    title.clear();
+    segments.clear();
+    std::vector<ContainerFragment> fragments;
+    if (readContainer(data, size, title, fragments)) {
+        segments.reserve(fragments.size());
+        for (const auto& fragment : fragments) {
+            DecompressedSegment segment;
+            segment.model = fragment.model;
+            if (fragment.kind == CONTAINER_FRAGMENT_KIND_RAW_ATOMS) {
+                if (!deserializeAtomCoordinates(fragment.payload.data(), fragment.payload.size(), segment.atoms)) {
+                    return false;
+                }
+            } else if (fragment.kind == CONTAINER_FRAGMENT_KIND_FCZ) {
+                Foldcomp compRes;
+                int flag = compRes.read(fragment.payload.data(), fragment.payload.size());
+                if (flag != 0) {
+                    return false;
+                }
+                compRes.useAltAtomOrder = useAltOrder;
+                flag = compRes.decompress(segment.atoms);
+                if (flag != 0) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            if (!fragment.chain.empty()) {
+                for (auto& atom : segment.atoms) {
+                    atom.chain = fragment.chain;
+                }
+            }
+            segments.push_back(std::move(segment));
+        }
+        return true;
+    }
+
+    Foldcomp compRes;
+    int flag = compRes.read(data, size);
+    if (flag != 0) {
+        return false;
+    }
+    compRes.useAltAtomOrder = useAltOrder;
+    DecompressedSegment segment;
+    if (compRes.decompress(segment.atoms) != 0) {
+        return false;
+    }
+    title = compRes.strTitle;
+    segments.push_back(std::move(segment));
+    return true;
+}
+
+bool decodeStructureToAtoms(
+    const char* data, size_t size, bool useAltOrder, std::string& title,
+    std::vector<AtomCoordinate>& atoms
+) {
+    atoms.clear();
+    std::vector<DecompressedSegment> segments;
+    if (!decodeStructureToSegments(data, size, useAltOrder, title, segments)) {
+        return false;
+    }
+    size_t totalAtoms = 0;
+    for (const auto& segment : segments) {
+        totalAtoms += segment.atoms.size();
+    }
+    atoms.reserve(totalAtoms);
+    for (auto& segment : segments) {
+        for (auto& atom : segment.atoms) {
+            atom.model = segment.model;
+            atoms.push_back(std::move(atom));
+        }
+    }
+    return true;
+}
+
+bool decodeStructureToPDB(
+    const char* data, size_t size, bool useAltOrder, std::string& title,
+    std::string& pdbText
+) {
+    std::vector<DecompressedSegment> segments;
+    if (!decodeStructureToSegments(data, size, useAltOrder, title, segments)) {
+        return false;
+    }
+    writeSegmentsToPDB(segments, title, pdbText);
+    return true;
+}

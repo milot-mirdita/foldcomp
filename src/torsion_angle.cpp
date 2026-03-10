@@ -21,6 +21,7 @@
 #include "atom_coordinate.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <iostream>
 #include <string>
 
@@ -120,25 +121,27 @@ void float3dVectorToDoubleArray(const std::vector<float>& fv, double output[3]) 
  * @param torsion
  */
 void writeTorsionAngles(const std::string& file_path, const std::vector<float>& torsion) {
-    std::ofstream output;
-    output.open(file_path, std::ios_base::out);
-    for (float angle : torsion) {
-        output << angle << "\n";
+    FILE* output = fopen(file_path.c_str(), "w");
+    if (output == NULL) {
+        return;
     }
-    output.close();
+    for (float angle : torsion) {
+        fprintf(output, "%f\n", angle);
+    }
+    fclose(output);
 }
 
 std::vector<float> readTorsionAngles(const std::string& file_path) {
-    std::ifstream input_file;
-    std::string line;
     std::vector<float> output;
-    float angle;
-    input_file.open(file_path, std::ios_base::in);
-    while(getline(input_file, line)) {
-        angle = std::stof(line);
-        output.push_back(angle);
+    FILE* input = fopen(file_path.c_str(), "r");
+    if (input == NULL) {
+        return output;
     }
-    input_file.close();
+    char line[128];
+    while (fgets(line, sizeof(line), input) != NULL) {
+        output.push_back(strtof(line, NULL));
+    }
+    fclose(input);
     return output;
 }
 
@@ -183,4 +186,3 @@ std::vector<float> decodeEncodedTorsionAngles(
     }
     return output;
 }
-

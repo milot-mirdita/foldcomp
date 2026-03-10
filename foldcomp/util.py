@@ -14,5 +14,6 @@ def split_pdb_by_chain(pdb_str):
             chain_str += line + "\n"
         else:
             continue
-    pdb_list.append(chain_str)
+    if chain is not None:
+        pdb_list.append(chain_str)
     return pdb_list
