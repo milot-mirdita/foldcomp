@@ -36,13 +36,6 @@ namespace {
 constexpr float MAX_PEPTIDE_BOND_DISTANCE = 2.5f;
 constexpr float MAX_PEPTIDE_BOND_DISTANCE_SQUARED =
     MAX_PEPTIDE_BOND_DISTANCE * MAX_PEPTIDE_BOND_DISTANCE;
-constexpr float MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE = 1.5f;
-constexpr float MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE_SQUARED =
-    MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE * MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE;
-constexpr float MAX_OMEGA_DEVIATION_FROM_CIS_OR_TRANS = 20.0f;
-constexpr float MIN_BACKBONE_BRIDGE_ANGLE = 100.0f;
-constexpr float MAX_BACKBONE_BRIDGE_ANGLE = 140.0f;
-constexpr size_t MAX_FCZ_REGION_RESIDUES = 32;
 
 void appendSpaces(std::string& output, size_t count) {
     output.append(count, ' ');
@@ -193,127 +186,6 @@ bool hasAbnormalPeptideGap(
     float dz = prevC->coordinate.z - currN->coordinate.z;
     float distanceSquared = dx * dx + dy * dy + dz * dz;
     return distanceSquared > MAX_PEPTIDE_BOND_DISTANCE_SQUARED;
-}
-
-float geometryDot(const float3d& a, const float3d& b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-float geometryNorm(const float3d& a) {
-    return std::sqrt(geometryDot(a, a));
-}
-
-float3d geometrySubtract(const float3d& a, const float3d& b) {
-    return float3d{a.x - b.x, a.y - b.y, a.z - b.z};
-}
-
-float3d geometryCross(const float3d& a, const float3d& b) {
-    return float3d{
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x
-    };
-}
-
-float angleDegrees(const float3d& a, const float3d& b, const float3d& c) {
-    float3d ba = geometrySubtract(a, b);
-    float3d bc = geometrySubtract(c, b);
-    float baNorm = geometryNorm(ba);
-    float bcNorm = geometryNorm(bc);
-    if (baNorm == 0.0f || bcNorm == 0.0f) {
-        return 180.0f;
-    }
-    float cosine = geometryDot(ba, bc) / (baNorm * bcNorm);
-    cosine = std::max(-1.0f, std::min(1.0f, cosine));
-    return std::acos(cosine) * 180.0f / static_cast<float>(M_PI);
-}
-
-float omegaDegrees(
-    const float3d& prevCA,
-    const float3d& prevC,
-    const float3d& currN,
-    const float3d& currCA
-) {
-    float3d b0 = geometrySubtract(prevCA, prevC);
-    float3d b1 = geometrySubtract(currN, prevC);
-    float3d b2 = geometrySubtract(currCA, currN);
-    float b1Norm = geometryNorm(b1);
-    if (b1Norm == 0.0f) {
-        return 180.0f;
-    }
-    float3d b1n{b1.x / b1Norm, b1.y / b1Norm, b1.z / b1Norm};
-    float3d v{
-        b0.x - geometryDot(b0, b1n) * b1n.x,
-        b0.y - geometryDot(b0, b1n) * b1n.y,
-        b0.z - geometryDot(b0, b1n) * b1n.z
-    };
-    float3d w{
-        b2.x - geometryDot(b2, b1n) * b1n.x,
-        b2.y - geometryDot(b2, b1n) * b1n.y,
-        b2.z - geometryDot(b2, b1n) * b1n.z
-    };
-    float x = geometryDot(v, w);
-    float y = geometryDot(geometryCross(b1n, v), w);
-    return std::atan2(y, x) * 180.0f / static_cast<float>(M_PI);
-}
-
-bool hasSuspiciousBackboneGeometryBetweenResidues(
-    tcb::span<const AtomCoordinate> atoms,
-    size_t previousResidueStart,
-    size_t previousResidueEnd,
-    size_t currentResidueStart,
-    size_t currentResidueEnd
-) {
-    const AtomCoordinate* prevCA = findAtomInRange(atoms, previousResidueStart, previousResidueEnd, "CA");
-    const AtomCoordinate* prevC = findAtomInRange(atoms, previousResidueStart, previousResidueEnd, "C");
-    const AtomCoordinate* currN = findAtomInRange(atoms, currentResidueStart, currentResidueEnd, "N");
-    const AtomCoordinate* currCA = findAtomInRange(atoms, currentResidueStart, currentResidueEnd, "CA");
-    if (prevC == nullptr || currN == nullptr) {
-        return false;
-    }
-
-    float dx = prevC->coordinate.x - currN->coordinate.x;
-    float dy = prevC->coordinate.y - currN->coordinate.y;
-    float dz = prevC->coordinate.z - currN->coordinate.z;
-    float cnDistanceSquared = dx * dx + dy * dy + dz * dz;
-    if (cnDistanceSquared > MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE_SQUARED) {
-        return true;
-    }
-
-    if (prevCA == nullptr || currCA == nullptr) {
-        return false;
-    }
-
-    float omega = omegaDegrees(prevCA->coordinate, prevC->coordinate, currN->coordinate, currCA->coordinate);
-    float absOmega = std::fabs(omega);
-    float nearestTrans = std::fabs(absOmega - 180.0f);
-    float nearestCis = absOmega;
-    if (std::min(nearestTrans, nearestCis) > MAX_OMEGA_DEVIATION_FROM_CIS_OR_TRANS) {
-        return true;
-    }
-
-    float caCNAngle = angleDegrees(prevCA->coordinate, prevC->coordinate, currN->coordinate);
-    if (caCNAngle < MIN_BACKBONE_BRIDGE_ANGLE || caCNAngle > MAX_BACKBONE_BRIDGE_ANGLE) {
-        return true;
-    }
-    float cNCAAngle = angleDegrees(prevC->coordinate, currN->coordinate, currCA->coordinate);
-    if (cNCAAngle < MIN_BACKBONE_BRIDGE_ANGLE || cNCAAngle > MAX_BACKBONE_BRIDGE_ANGLE) {
-        return true;
-    }
-
-    return false;
-}
-
-template <typename ResidueRegionT>
-void markSuspiciousResidueWindow(std::vector<ResidueRegionT>& residues, size_t rightResidueIndex) {
-    if (residues.empty()) {
-        return;
-    }
-    size_t first = rightResidueIndex > 1 ? rightResidueIndex - 2 : 0;
-    size_t last = std::min(residues.size() - 1, rightResidueIndex + 1);
-    for (size_t idx = first; idx <= last; idx++) {
-        residues[idx].suspiciousGeometry = true;
-    }
 }
 
 size_t findResidueEnd(
@@ -943,7 +815,6 @@ std::vector<std::pair<size_t, size_t>> identifyCompleteBackboneRegions(
         size_t start;
         size_t end;
         bool completeBackbone;
-        bool suspiciousGeometry;
     };
 
     std::vector<ResidueRegion> residues;
@@ -969,23 +840,13 @@ std::vector<std::pair<size_t, size_t>> identifyCompleteBackboneRegions(
         bool requiresRawEncoding = residueRequiresRawEncoding(
             tcb::span<const AtomCoordinate>(atoms.data() + residueStart, i - residueStart)
         );
-        residues.push_back({residueStart, i, hasN && hasCA && hasC && !requiresRawEncoding, false});
+        residues.push_back({residueStart, i, hasN && hasCA && hasC && !requiresRawEncoding});
         residueStart = i;
-    }
-
-    for (size_t i = 1; i < residues.size(); i++) {
-        if (!residues[i - 1].completeBackbone || !residues[i].completeBackbone) {
-            continue;
-        }
-        if (hasSuspiciousBackboneGeometryBetweenResidues(
-                atoms, residues[i - 1].start, residues[i - 1].end, residues[i].start, residues[i].end)) {
-            markSuspiciousResidueWindow(residues, i);
-        }
     }
 
     size_t i = 0;
     while (i < residues.size()) {
-        if (!residues[i].completeBackbone || residues[i].suspiciousGeometry) {
+        if (!residues[i].completeBackbone) {
             i++;
             continue;
         }
@@ -993,7 +854,7 @@ std::vector<std::pair<size_t, size_t>> identifyCompleteBackboneRegions(
         size_t start = residues[i].start;
         size_t end = residues[i].end;
         i++;
-        while (i < residues.size() && residues[i].completeBackbone && !residues[i].suspiciousGeometry) {
+        while (i < residues.size() && residues[i].completeBackbone) {
             end = residues[i].end;
             i++;
         }
@@ -1014,7 +875,6 @@ std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordina
         size_t start;
         size_t end;
         bool completeBackbone;
-        bool suspiciousGeometry;
     };
 
     std::vector<ResidueRegion> residues;
@@ -1040,27 +900,17 @@ std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordina
         bool requiresRawEncoding = residueRequiresRawEncoding(
             tcb::span<const AtomCoordinate>(atoms.data() + residueStart, i - residueStart)
         );
-        residues.push_back({residueStart, i, hasN && hasCA && hasC && !requiresRawEncoding, false});
+        residues.push_back({residueStart, i, hasN && hasCA && hasC && !requiresRawEncoding});
         residueStart = i;
-    }
-
-    for (size_t i = 1; i < residues.size(); i++) {
-        if (!residues[i - 1].completeBackbone || !residues[i].completeBackbone) {
-            continue;
-        }
-        if (hasSuspiciousBackboneGeometryBetweenResidues(
-                atoms, residues[i - 1].start, residues[i - 1].end, residues[i].start, residues[i].end)) {
-            markSuspiciousResidueWindow(residues, i);
-        }
     }
 
     size_t i = 0;
     while (i < residues.size()) {
-        if (!residues[i].completeBackbone || residues[i].suspiciousGeometry) {
+        if (!residues[i].completeBackbone) {
             size_t start = residues[i].start;
             size_t end = residues[i].end;
             i++;
-            while (i < residues.size() && (!residues[i].completeBackbone || residues[i].suspiciousGeometry)) {
+            while (i < residues.size() && !residues[i].completeBackbone) {
                 end = residues[i].end;
                 i++;
             }
@@ -1072,27 +922,13 @@ std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordina
         size_t start = residues[i].start;
         size_t end = residues[i].end;
         i++;
-        while (i < residues.size() && residues[i].completeBackbone && !residues[i].suspiciousGeometry) {
+        while (i < residues.size() && residues[i].completeBackbone) {
             end = residues[i].end;
             i++;
         }
         const size_t runLength = i - runStartIndex;
         if (runLength >= 2) {
-            size_t chunkStartIndex = runStartIndex;
-            while (chunkStartIndex < i) {
-                size_t remaining = i - chunkStartIndex;
-                size_t chunkLength = std::min(MAX_FCZ_REGION_RESIDUES, remaining);
-                if (remaining > MAX_FCZ_REGION_RESIDUES && remaining - chunkLength == 1) {
-                    chunkLength--;
-                }
-
-                output.push_back({
-                    residues[chunkStartIndex].start,
-                    residues[chunkStartIndex + chunkLength - 1].end,
-                    true
-                });
-                chunkStartIndex += chunkLength;
-            }
+            output.push_back({start, end, true});
         } else {
             output.push_back({start, end, false});
         }

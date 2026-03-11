@@ -37,11 +37,11 @@ run_reference_cases() {
 
   "$FOLDCOMP_BIN" compress "$TEST_DIR/test.pdb"
   "$FOLDCOMP_BIN" decompress "$TEST_DIR/test.fcz" "$TEST_DIR/test_fcz.cif"
-  assert_rmsd_exact "$TEST_DIR/test.pdb" "$TEST_DIR/test_fcz.cif" "0.0322624" "0.0769879"
+  assert_rmsd_exact "$TEST_DIR/test.pdb" "$TEST_DIR/test_fcz.cif" "0.0442852" "0.0819437"
 
   "$FOLDCOMP_BIN" compress "$TEST_DIR/test.cif.gz"
   "$FOLDCOMP_BIN" decompress -a "$TEST_DIR/test.cif.fcz" "$TEST_DIR/test.cif_fcz.cif"
-  assert_rmsd_exact "$TEST_DIR/test.cif.gz" "$TEST_DIR/test.cif_fcz.cif" "0.0380966" "0.122364"
+  assert_rmsd_exact "$TEST_DIR/test.cif.gz" "$TEST_DIR/test.cif_fcz.cif" "0.0562849" "0.130271"
 }
 
 run_regression_case() {
@@ -66,13 +66,13 @@ run_regression_case() {
 }
 
 run_reference_cases
-run_regression_case "1cfg" "0" "0" "0" "0"
-run_regression_case "1adn" "0.261305" "0.311185" "0" "0"
-run_regression_case "1dlp" "0.0415883" "0.336396" "0.014391" "0.132124"
-run_regression_case "1hrn" "0.0730179" "0.168113" "0" "0"
-run_regression_case "1jwt" "0.0783066" "0.265589" "0" "0"
-run_regression_case "1lyz" "0.0870845" "0.214444" "0" "0"
-run_regression_case "2ap2" "0.0359238" "0.106224" "0" "0"
-run_regression_case "2gn5" "0.0237757" "0.439115" "0.00025578" "0.0256872"
-run_regression_case "4kuk" "0.0411448" "0.0972185" "0" "0"
+run_regression_case "1cfg" "0.155475" "0.620551" "0" "0"
+run_regression_case "1adn" "0.30096" "0.345061" "0" "0"
+run_regression_case "1dlp" "0.160869" "0.539957" "0.00753061" "0.050874"
+run_regression_case "1hrn" "0.0843169" "0.162157" "0" "0"
+run_regression_case "1jwt" "0.11271" "0.303602" "0.0781373" "0.216097"
+run_regression_case "1lyz" "0.493174" "0.694103" "0" "0"
+run_regression_case "2ap2" "0.0482384" "0.111911" "0" "0"
+run_regression_case "2gn5" "0.115267" "0.765166" "0" "0"
+run_regression_case "4kuk" "0.0422129" "0.106495" "0" "0"
 run_regression_case "7c2s" "0" "0" "0" "0"
