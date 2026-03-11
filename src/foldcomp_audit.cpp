@@ -711,8 +711,24 @@ int commandContainerReport(const std::string& encodedPath) {
     return 0;
 }
 
-int commandDbCompare(const std::string& sourceDir, const std::string& dbPath) {
-    std::vector<std::string> files = getFilesInDirectory(sourceDir, false);
+bool looksLikeDividedRoot(const std::string& sourceDir) {
+    if (!fs::is_directory(sourceDir)) {
+        return false;
+    }
+    for (const auto& entry : fs::directory_iterator(sourceDir)) {
+        if (!entry.is_directory()) {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.size() == 2) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int commandDbCompare(const std::string& sourceDir, const std::string& dbPath, bool recursive) {
+    std::vector<std::string> files = getFilesInDirectory(sourceDir, recursive);
     std::sort(files.begin(), files.end());
 
     void* reader = make_reader(dbPath.c_str(), (dbPath + ".index").c_str(),
@@ -825,7 +841,7 @@ int main(int argc, char** argv) {
                   << "  foldcomp_audit summarize <structure>\n"
                   << "  foldcomp_audit compare <source_structure> <roundtrip_structure>\n"
                   << "  foldcomp_audit fallback-report <structure_or_directory>\n"
-                  << "  foldcomp_audit db-compare <source_directory> <db>\n"
+                  << "  foldcomp_audit db-compare [--recursive] <source_directory> <db>\n"
                   << "  foldcomp_audit db-entry-compare <source_structure> <db>\n"
                   << "  foldcomp_audit dump-residues <structure>\n"
                   << "  foldcomp_audit db-entry-dump-residues <source_structure> <db>\n"
@@ -849,11 +865,22 @@ int main(int argc, char** argv) {
         return commandFallbackReport(argv[2]);
     }
     if (command == "db-compare") {
-        if (argc < 4) {
+        bool recursive = false;
+        int argIndex = 2;
+        if (argc >= 3 && std::string(argv[2]) == "--recursive") {
+            recursive = true;
+            argIndex++;
+        }
+        if (argc < argIndex + 2) {
             std::cerr << "[Error] db-compare requires source_directory and db path\n";
             return 1;
         }
-        return commandDbCompare(argv[2], argv[3]);
+        const std::string sourceDir = argv[argIndex];
+        const std::string dbPath = argv[argIndex + 1];
+        if (!recursive) {
+            recursive = looksLikeDividedRoot(sourceDir);
+        }
+        return commandDbCompare(sourceDir, dbPath, recursive);
     }
     if (command == "db-entry-compare") {
         if (argc < 4) {
