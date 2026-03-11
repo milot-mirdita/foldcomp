@@ -68,7 +68,8 @@ void StructureReader::updateStructure(void* void_st, const std::string& filename
                 gemmi::ResidueInfo resInfo = gemmi::find_tabulated_residue(res.name);
                 bool isProteinLike = resInfo.found() && resInfo.is_amino_acid();
                 if (!isProteinLike) {
-                    // Fallback for modified/unknown polymer residues with peptide backbone atoms.
+                    // Fallback for modified/unknown residues with peptide-like backbone atoms.
+                    // mmCIF roundtrips do not always preserve Gemmi's polymer entity typing.
                     bool hasN = false;
                     bool hasCA = false;
                     bool hasC = false;
@@ -81,7 +82,7 @@ void StructureReader::updateStructure(void* void_st, const std::string& filename
                             hasC = true;
                         }
                     }
-                    isProteinLike = (res.entity_type == gemmi::EntityType::Polymer && hasN && hasCA && hasC);
+                    isProteinLike = (hasN && hasCA && hasC);
                 }
                 if (!isProteinLike) {
                     continue;
@@ -89,10 +90,11 @@ void StructureReader::updateStructure(void* void_st, const std::string& filename
                 for (gemmi::Atom& atom : res.atoms) {
                     AtomCoordinate ac = AtomCoordinate(
                         atom.name, res.name, ch.name, atom.serial, (int)res.seqid.num,
-                        (float)atom.pos.x, (float)atom.pos.y, (float)atom.pos.z
+                        (float)atom.pos.x, (float)atom.pos.y, (float)atom.pos.z,
+                        (float)atom.occ, (float)atom.b_iso, static_cast<int>(modelIndex + 1),
+                        res.seqid.icode == '\0' ? ' ' : res.seqid.icode,
+                        atom.altloc == '\0' ? ' ' : atom.altloc
                     );
-                    ac.tempFactor = atom.b_iso;
-                    ac.model = static_cast<int>(modelIndex + 1);
                     this->atoms.push_back(ac);
                 }
             }

@@ -12,6 +12,8 @@
  * Copyright © 2021 Hyunbin Kim, All rights reserved
  */
 #include "atom_coordinate.h"
+#include "amino_acid.h"
+#include "foldcomp.h"
 
 #include <algorithm>
 #include <cctype>
@@ -31,22 +33,16 @@
 
 namespace {
 
-bool startsNewResidue(const AtomCoordinate& current, const AtomCoordinate& previous) {
-    if (current.chain != previous.chain) {
-        return true;
-    }
-    if (current.model != previous.model) {
-        return true;
-    }
-    if (current.residue_index != previous.residue_index) {
-        return true;
-    }
-    if (current.atom == "N" && previous.atom != "N") {
-        // Reused residue indices can still denote a new residue in author numbering.
-        return true;
-    }
-    return false;
-}
+constexpr float MAX_PEPTIDE_BOND_DISTANCE = 2.5f;
+constexpr float MAX_PEPTIDE_BOND_DISTANCE_SQUARED =
+    MAX_PEPTIDE_BOND_DISTANCE * MAX_PEPTIDE_BOND_DISTANCE;
+constexpr float MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE = 1.5f;
+constexpr float MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE_SQUARED =
+    MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE * MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE;
+constexpr float MAX_OMEGA_DEVIATION_FROM_CIS_OR_TRANS = 20.0f;
+constexpr float MIN_BACKBONE_BRIDGE_ANGLE = 100.0f;
+constexpr float MAX_BACKBONE_BRIDGE_ANGLE = 140.0f;
+constexpr size_t MAX_FCZ_REGION_RESIDUES = 32;
 
 void appendSpaces(std::string& output, size_t count) {
     output.append(count, ' ');
@@ -154,6 +150,184 @@ void appendTitleLines(std::string& output, const std::string& title) {
     }
 }
 
+bool residueRequiresRawEncoding(const tcb::span<const AtomCoordinate>& residueAtoms) {
+    for (const auto& atom : residueAtoms) {
+        if (atom.altloc != ' ' && atom.altloc != '\0') {
+            return true;
+        }
+        if (atom.insertion_code != ' ' && atom.insertion_code != '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+const AtomCoordinate* findAtomInRange(
+    tcb::span<const AtomCoordinate> atoms,
+    size_t start,
+    size_t end,
+    const char* atomName
+) {
+    for (size_t i = start; i < end; i++) {
+        if (atoms[i].atom == atomName) {
+            return &atoms[i];
+        }
+    }
+    return nullptr;
+}
+
+bool hasAbnormalPeptideGap(
+    tcb::span<const AtomCoordinate> atoms,
+    size_t previousResidueStart,
+    size_t previousResidueEnd,
+    size_t currentResidueStart,
+    size_t currentResidueEnd
+) {
+    const AtomCoordinate* prevC = findAtomInRange(atoms, previousResidueStart, previousResidueEnd, "C");
+    const AtomCoordinate* currN = findAtomInRange(atoms, currentResidueStart, currentResidueEnd, "N");
+    if (prevC == nullptr || currN == nullptr) {
+        return false;
+    }
+    float dx = prevC->coordinate.x - currN->coordinate.x;
+    float dy = prevC->coordinate.y - currN->coordinate.y;
+    float dz = prevC->coordinate.z - currN->coordinate.z;
+    float distanceSquared = dx * dx + dy * dy + dz * dz;
+    return distanceSquared > MAX_PEPTIDE_BOND_DISTANCE_SQUARED;
+}
+
+float geometryDot(const float3d& a, const float3d& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+float geometryNorm(const float3d& a) {
+    return std::sqrt(geometryDot(a, a));
+}
+
+float3d geometrySubtract(const float3d& a, const float3d& b) {
+    return float3d{a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+float3d geometryCross(const float3d& a, const float3d& b) {
+    return float3d{
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x
+    };
+}
+
+float angleDegrees(const float3d& a, const float3d& b, const float3d& c) {
+    float3d ba = geometrySubtract(a, b);
+    float3d bc = geometrySubtract(c, b);
+    float baNorm = geometryNorm(ba);
+    float bcNorm = geometryNorm(bc);
+    if (baNorm == 0.0f || bcNorm == 0.0f) {
+        return 180.0f;
+    }
+    float cosine = geometryDot(ba, bc) / (baNorm * bcNorm);
+    cosine = std::max(-1.0f, std::min(1.0f, cosine));
+    return std::acos(cosine) * 180.0f / static_cast<float>(M_PI);
+}
+
+float omegaDegrees(
+    const float3d& prevCA,
+    const float3d& prevC,
+    const float3d& currN,
+    const float3d& currCA
+) {
+    float3d b0 = geometrySubtract(prevCA, prevC);
+    float3d b1 = geometrySubtract(currN, prevC);
+    float3d b2 = geometrySubtract(currCA, currN);
+    float b1Norm = geometryNorm(b1);
+    if (b1Norm == 0.0f) {
+        return 180.0f;
+    }
+    float3d b1n{b1.x / b1Norm, b1.y / b1Norm, b1.z / b1Norm};
+    float3d v{
+        b0.x - geometryDot(b0, b1n) * b1n.x,
+        b0.y - geometryDot(b0, b1n) * b1n.y,
+        b0.z - geometryDot(b0, b1n) * b1n.z
+    };
+    float3d w{
+        b2.x - geometryDot(b2, b1n) * b1n.x,
+        b2.y - geometryDot(b2, b1n) * b1n.y,
+        b2.z - geometryDot(b2, b1n) * b1n.z
+    };
+    float x = geometryDot(v, w);
+    float y = geometryDot(geometryCross(b1n, v), w);
+    return std::atan2(y, x) * 180.0f / static_cast<float>(M_PI);
+}
+
+bool hasSuspiciousBackboneGeometryBetweenResidues(
+    tcb::span<const AtomCoordinate> atoms,
+    size_t previousResidueStart,
+    size_t previousResidueEnd,
+    size_t currentResidueStart,
+    size_t currentResidueEnd
+) {
+    const AtomCoordinate* prevCA = findAtomInRange(atoms, previousResidueStart, previousResidueEnd, "CA");
+    const AtomCoordinate* prevC = findAtomInRange(atoms, previousResidueStart, previousResidueEnd, "C");
+    const AtomCoordinate* currN = findAtomInRange(atoms, currentResidueStart, currentResidueEnd, "N");
+    const AtomCoordinate* currCA = findAtomInRange(atoms, currentResidueStart, currentResidueEnd, "CA");
+    if (prevC == nullptr || currN == nullptr) {
+        return false;
+    }
+
+    float dx = prevC->coordinate.x - currN->coordinate.x;
+    float dy = prevC->coordinate.y - currN->coordinate.y;
+    float dz = prevC->coordinate.z - currN->coordinate.z;
+    float cnDistanceSquared = dx * dx + dy * dy + dz * dz;
+    if (cnDistanceSquared > MAX_SUSPICIOUS_PEPTIDE_BOND_DISTANCE_SQUARED) {
+        return true;
+    }
+
+    if (prevCA == nullptr || currCA == nullptr) {
+        return false;
+    }
+
+    float omega = omegaDegrees(prevCA->coordinate, prevC->coordinate, currN->coordinate, currCA->coordinate);
+    float absOmega = std::fabs(omega);
+    float nearestTrans = std::fabs(absOmega - 180.0f);
+    float nearestCis = absOmega;
+    if (std::min(nearestTrans, nearestCis) > MAX_OMEGA_DEVIATION_FROM_CIS_OR_TRANS) {
+        return true;
+    }
+
+    float caCNAngle = angleDegrees(prevCA->coordinate, prevC->coordinate, currN->coordinate);
+    if (caCNAngle < MIN_BACKBONE_BRIDGE_ANGLE || caCNAngle > MAX_BACKBONE_BRIDGE_ANGLE) {
+        return true;
+    }
+    float cNCAAngle = angleDegrees(prevC->coordinate, currN->coordinate, currCA->coordinate);
+    if (cNCAAngle < MIN_BACKBONE_BRIDGE_ANGLE || cNCAAngle > MAX_BACKBONE_BRIDGE_ANGLE) {
+        return true;
+    }
+
+    return false;
+}
+
+template <typename ResidueRegionT>
+void markSuspiciousResidueWindow(std::vector<ResidueRegionT>& residues, size_t rightResidueIndex) {
+    if (residues.empty()) {
+        return;
+    }
+    size_t first = rightResidueIndex > 1 ? rightResidueIndex - 2 : 0;
+    size_t last = std::min(residues.size() - 1, rightResidueIndex + 1);
+    for (size_t idx = first; idx <= last; idx++) {
+        residues[idx].suspiciousGeometry = true;
+    }
+}
+
+size_t findResidueEnd(
+    const std::vector<AtomCoordinate>& atoms,
+    size_t residueStart,
+    size_t chainEnd
+) {
+    size_t residueEnd = residueStart + 1;
+    while (residueEnd < chainEnd && !startsNewResidue(atoms[residueEnd], atoms[residueEnd - 1])) {
+        residueEnd++;
+    }
+    return residueEnd;
+}
+
 #ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
 std::string sanitizeMMCIFDataName(const std::string& title) {
     if (title.empty()) {
@@ -200,8 +374,8 @@ gemmi::Element inferGemmiElement(const std::string& atomName) {
 AtomCoordinate::AtomCoordinate(
     std::string a, std::string r, std::string c,
     int ai, int ri, float x, float y, float z,
-    float occupancy, float tempFactor, int model
-): atom(a), residue(r), chain(c), atom_index(ai), residue_index(ri), occupancy(occupancy), tempFactor(tempFactor), model(model) {
+    float occupancy, float tempFactor, int model, char insertionCode, char altloc
+): atom(a), residue(r), chain(c), atom_index(ai), residue_index(ri), occupancy(occupancy), tempFactor(tempFactor), model(model), insertion_code(insertionCode), altloc(altloc) {
     this->coordinate = {x, y, z};
 }
 
@@ -217,8 +391,31 @@ AtomCoordinate::AtomCoordinate(
 AtomCoordinate::AtomCoordinate(
     std::string a, std::string r, std::string c,
     int ai, int ri, float3d coord,
-    float occupancy, float tempFactor, int model
-): atom(a), residue(r), chain(c), atom_index(ai), residue_index(ri), coordinate(coord), occupancy(occupancy), tempFactor(tempFactor), model(model) {
+    float occupancy, float tempFactor, int model, char insertionCode, char altloc
+): atom(a), residue(r), chain(c), atom_index(ai), residue_index(ri), coordinate(coord), occupancy(occupancy), tempFactor(tempFactor), model(model), insertion_code(insertionCode), altloc(altloc) {
+}
+
+bool startsNewResidue(const AtomCoordinate& current, const AtomCoordinate& previous) {
+    if (current.chain != previous.chain) {
+        return true;
+    }
+    if (current.model != previous.model) {
+        return true;
+    }
+    if (current.residue_index != previous.residue_index) {
+        return true;
+    }
+    if (current.insertion_code != previous.insertion_code) {
+        return true;
+    }
+    if (current.residue != previous.residue) {
+        return true;
+    }
+    if (current.atom == "N" && previous.atom != "N") {
+        // Reused residue indices can still denote a new residue in author numbering.
+        return true;
+    }
+    return false;
 }
 
 bool AtomCoordinate::operator==(const AtomCoordinate& other) const {
@@ -229,6 +426,8 @@ bool AtomCoordinate::operator==(const AtomCoordinate& other) const {
         (this->residue_index == other.residue_index) &&
         (this->chain == other.chain) &&
         (this->model == other.model) &&
+        (this->insertion_code == other.insertion_code) &&
+        (this->altloc == other.altloc) &&
         (this->coordinate.x == other.coordinate.x) &&
         (this->coordinate.y == other.coordinate.y) &&
         (this->coordinate.z == other.coordinate.z)
@@ -368,16 +567,18 @@ void writeAtomCoordinatesToPDB(
             appendLeftAligned(output, atom.atom, 3);
         }
         output.push_back(' ');
+        output.push_back(atom.altloc == '\0' ? ' ' : atom.altloc);
         appendRightAligned(output, atom.residue, 3);
         output.push_back(' ');
         char chainId = atom.chain.empty() ? ' ' : atom.chain[0];
         output.push_back(chainId);
         appendRightAlignedInt(output, atom.residue_index, 4);
+        output.push_back(atom.insertion_code == '\0' ? ' ' : atom.insertion_code);
         output.append("    ", 4);
         appendRightAlignedFixed<8, 1000, 3>(output, atom.coordinate.x);
         appendRightAlignedFixed<8, 1000, 3>(output, atom.coordinate.y);
         appendRightAlignedFixed<8, 1000, 3>(output, atom.coordinate.z);
-        output.append("  1.00", 6);
+        appendRightAlignedFixed<6, 100, 2>(output, atom.occupancy > 0.0f ? atom.occupancy : 1.0f);
         appendRightAlignedFixed<6, 100, 2>(output, atom.tempFactor);
         output.append("          ", 10);
         output.push_back(' ');
@@ -391,6 +592,7 @@ void writeAtomCoordinatesToPDB(
             output.push_back(' ');
             output.push_back(chainId);
             appendRightAlignedInt(output, atom.residue_index, 4);
+            output.push_back(atom.insertion_code == '\0' ? ' ' : atom.insertion_code);
             output.push_back('\n');
         }
     }
@@ -448,7 +650,7 @@ bool writeAtomCoordinatesToMMCIF(
 
         gemmi::Residue residue;
         residue.name = firstAtom.residue;
-        residue.seqid = gemmi::SeqId(firstAtom.residue_index, ' ');
+        residue.seqid = gemmi::SeqId(firstAtom.residue_index, firstAtom.insertion_code == '\0' ? ' ' : firstAtom.insertion_code);
         residue.subchain = currentChain;
         residue.entity_id = "1";
         residue.label_seq = currentLabelSeq;
@@ -464,6 +666,9 @@ bool writeAtomCoordinatesToMMCIF(
             atom.occ = atomCoordinate.occupancy > 0.0f ? atomCoordinate.occupancy : 1.0f;
             atom.b_iso = atomCoordinate.tempFactor;
             atom.element = inferGemmiElement(atomCoordinate.atom);
+            atom.altloc = (atomCoordinate.altloc == '\0' || atomCoordinate.altloc == ' ')
+                              ? '\0'
+                              : atomCoordinate.altloc;
             residue.atoms.push_back(std::move(atom));
         }
         chain->residues.push_back(std::move(residue));
@@ -559,7 +764,8 @@ void removeAlternativePosition(std::vector<AtomCoordinate>& atoms) {
             current.residue == previous.residue &&
             current.residue_index == previous.residue_index &&
             current.chain == previous.chain &&
-            current.model == previous.model) {
+            current.model == previous.model &&
+            current.insertion_code == previous.insertion_code) {
             continue;
         }
         if (writeIndex != readIndex) {
@@ -701,6 +907,8 @@ std::vector<std::pair<size_t, size_t>> identifyDiscontinousResInd(
         return output;
     }
     size_t start = chain_start;
+    size_t previousResidueStart = chain_start;
+    size_t previousResidueEnd = chain_start;
     int previousResidueIndex = atoms[chain_start].residue_index;
 
     for (size_t i = chain_start + 1; i < chain_end; i++) {
@@ -708,12 +916,16 @@ std::vector<std::pair<size_t, size_t>> identifyDiscontinousResInd(
             continue;
         }
 
+        previousResidueEnd = i;
         int currentResidueIndex = atoms[i].residue_index;
-        if (currentResidueIndex != previousResidueIndex + 1) {
+        size_t currentResidueEnd = findResidueEnd(atoms, i, chain_end);
+        if (currentResidueIndex != previousResidueIndex + 1 ||
+            hasAbnormalPeptideGap(atoms, previousResidueStart, previousResidueEnd, i, currentResidueEnd)) {
             output.emplace_back(start, i);
             start = i;
         }
         previousResidueIndex = currentResidueIndex;
+        previousResidueStart = i;
     }
     output.emplace_back(start, chain_end);
     return output;
@@ -727,62 +939,11 @@ std::vector<std::pair<size_t, size_t>> identifyCompleteBackboneRegions(
         return output;
     }
 
-    size_t residueStart = 0;
-    size_t runStart = atoms.size();
-    size_t completeResiduesInRun = 0;
-
-    auto flushRun = [&](size_t residueEnd) {
-        if (runStart < atoms.size() && completeResiduesInRun >= 2) {
-            output.emplace_back(runStart, residueEnd);
-        }
-        runStart = atoms.size();
-        completeResiduesInRun = 0;
-    };
-
-    for (size_t i = 1; i <= atoms.size(); i++) {
-        bool endOfResidue = (i == atoms.size()) || startsNewResidue(atoms[i], atoms[i - 1]);
-        if (!endOfResidue) {
-            continue;
-        }
-
-        bool hasN = false;
-        bool hasCA = false;
-        bool hasC = false;
-        for (size_t j = residueStart; j < i; j++) {
-            if (atoms[j].atom == "N") {
-                hasN = true;
-            } else if (atoms[j].atom == "CA") {
-                hasCA = true;
-            } else if (atoms[j].atom == "C") {
-                hasC = true;
-            }
-        }
-
-        if (hasN && hasCA && hasC) {
-            if (runStart == atoms.size()) {
-                runStart = residueStart;
-            }
-            completeResiduesInRun++;
-        } else {
-            flushRun(residueStart);
-        }
-        residueStart = i;
-    }
-
-    flushRun(atoms.size());
-    return output;
-}
-
-std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordinate>& atoms) {
-    std::vector<BackboneRegion> output;
-    if (atoms.empty()) {
-        return output;
-    }
-
     struct ResidueRegion {
         size_t start;
         size_t end;
         bool completeBackbone;
+        bool suspiciousGeometry;
     };
 
     std::vector<ResidueRegion> residues;
@@ -805,17 +966,101 @@ std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordina
                 hasC = true;
             }
         }
-        residues.push_back({residueStart, i, hasN && hasCA && hasC});
+        bool requiresRawEncoding = residueRequiresRawEncoding(
+            tcb::span<const AtomCoordinate>(atoms.data() + residueStart, i - residueStart)
+        );
+        residues.push_back({residueStart, i, hasN && hasCA && hasC && !requiresRawEncoding, false});
         residueStart = i;
+    }
+
+    for (size_t i = 1; i < residues.size(); i++) {
+        if (!residues[i - 1].completeBackbone || !residues[i].completeBackbone) {
+            continue;
+        }
+        if (hasSuspiciousBackboneGeometryBetweenResidues(
+                atoms, residues[i - 1].start, residues[i - 1].end, residues[i].start, residues[i].end)) {
+            markSuspiciousResidueWindow(residues, i);
+        }
     }
 
     size_t i = 0;
     while (i < residues.size()) {
-        if (!residues[i].completeBackbone) {
+        if (!residues[i].completeBackbone || residues[i].suspiciousGeometry) {
+            i++;
+            continue;
+        }
+        size_t runStartIndex = i;
+        size_t start = residues[i].start;
+        size_t end = residues[i].end;
+        i++;
+        while (i < residues.size() && residues[i].completeBackbone && !residues[i].suspiciousGeometry) {
+            end = residues[i].end;
+            i++;
+        }
+        if (i - runStartIndex >= 2) {
+            output.emplace_back(start, end);
+        }
+    }
+    return output;
+}
+
+std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordinate>& atoms) {
+    std::vector<BackboneRegion> output;
+    if (atoms.empty()) {
+        return output;
+    }
+
+    struct ResidueRegion {
+        size_t start;
+        size_t end;
+        bool completeBackbone;
+        bool suspiciousGeometry;
+    };
+
+    std::vector<ResidueRegion> residues;
+    size_t residueStart = 0;
+    for (size_t i = 1; i <= atoms.size(); i++) {
+        bool endOfResidue = (i == atoms.size()) || startsNewResidue(atoms[i], atoms[i - 1]);
+        if (!endOfResidue) {
+            continue;
+        }
+
+        bool hasN = false;
+        bool hasCA = false;
+        bool hasC = false;
+        for (size_t j = residueStart; j < i; j++) {
+            if (atoms[j].atom == "N") {
+                hasN = true;
+            } else if (atoms[j].atom == "CA") {
+                hasCA = true;
+            } else if (atoms[j].atom == "C") {
+                hasC = true;
+            }
+        }
+        bool requiresRawEncoding = residueRequiresRawEncoding(
+            tcb::span<const AtomCoordinate>(atoms.data() + residueStart, i - residueStart)
+        );
+        residues.push_back({residueStart, i, hasN && hasCA && hasC && !requiresRawEncoding, false});
+        residueStart = i;
+    }
+
+    for (size_t i = 1; i < residues.size(); i++) {
+        if (!residues[i - 1].completeBackbone || !residues[i].completeBackbone) {
+            continue;
+        }
+        if (hasSuspiciousBackboneGeometryBetweenResidues(
+                atoms, residues[i - 1].start, residues[i - 1].end, residues[i].start, residues[i].end)) {
+            markSuspiciousResidueWindow(residues, i);
+        }
+    }
+
+    size_t i = 0;
+    while (i < residues.size()) {
+        if (!residues[i].completeBackbone || residues[i].suspiciousGeometry) {
             size_t start = residues[i].start;
             size_t end = residues[i].end;
             i++;
-            while (i < residues.size() && !residues[i].completeBackbone) {
+            while (i < residues.size() && (!residues[i].completeBackbone || residues[i].suspiciousGeometry)) {
                 end = residues[i].end;
                 i++;
             }
@@ -827,12 +1072,27 @@ std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordina
         size_t start = residues[i].start;
         size_t end = residues[i].end;
         i++;
-        while (i < residues.size() && residues[i].completeBackbone) {
+        while (i < residues.size() && residues[i].completeBackbone && !residues[i].suspiciousGeometry) {
             end = residues[i].end;
             i++;
         }
-        if (i - runStartIndex >= 2) {
-            output.push_back({start, end, true});
+        const size_t runLength = i - runStartIndex;
+        if (runLength >= 2) {
+            size_t chunkStartIndex = runStartIndex;
+            while (chunkStartIndex < i) {
+                size_t remaining = i - chunkStartIndex;
+                size_t chunkLength = std::min(MAX_FCZ_REGION_RESIDUES, remaining);
+                if (remaining > MAX_FCZ_REGION_RESIDUES && remaining - chunkLength == 1) {
+                    chunkLength--;
+                }
+
+                output.push_back({
+                    residues[chunkStartIndex].start,
+                    residues[chunkStartIndex + chunkLength - 1].end,
+                    true
+                });
+                chunkStartIndex += chunkLength;
+            }
         } else {
             output.push_back({start, end, false});
         }
@@ -867,7 +1127,7 @@ bool serializeAtomCoordinates(
     std::string& output
 ) {
     output.clear();
-    output.reserve(sizeof(uint32_t) + atoms.size() * 32);
+    output.reserve(sizeof(uint32_t) + atoms.size() * 40);
     uint32_t atomCount = static_cast<uint32_t>(atoms.size());
     appendBinaryValue(output, atomCount);
     for (const auto& atom : atoms) {
@@ -885,6 +1145,8 @@ bool serializeAtomCoordinates(
         appendBinaryValue(output, atom.coordinate.z);
         appendBinaryValue(output, atom.occupancy);
         appendBinaryValue(output, atom.tempFactor);
+        appendBinaryValue(output, atom.insertion_code);
+        appendBinaryValue(output, atom.altloc);
         output.append(atom.atom);
         output.append(atom.residue);
     }
@@ -903,37 +1165,52 @@ bool deserializeAtomCoordinates(
     size_t size,
     std::vector<AtomCoordinate>& atoms
 ) {
-    atoms.clear();
-    size_t offset = 0;
-    uint32_t atomCount = 0;
-    if (!readBinaryValue(data, size, offset, atomCount)) {
-        return false;
-    }
-    atoms.reserve(atomCount);
-    for (uint32_t i = 0; i < atomCount; i++) {
-        uint8_t atomNameLen = 0;
-        uint8_t residueNameLen = 0;
-        AtomCoordinate atom;
-        if (!readBinaryValue(data, size, offset, atomNameLen) ||
-            !readBinaryValue(data, size, offset, residueNameLen) ||
-            !readBinaryValue(data, size, offset, atom.atom_index) ||
-            !readBinaryValue(data, size, offset, atom.residue_index) ||
-            !readBinaryValue(data, size, offset, atom.coordinate.x) ||
-            !readBinaryValue(data, size, offset, atom.coordinate.y) ||
-            !readBinaryValue(data, size, offset, atom.coordinate.z) ||
-            !readBinaryValue(data, size, offset, atom.occupancy) ||
-            !readBinaryValue(data, size, offset, atom.tempFactor)) {
+    auto parse = [&](bool hasIdentityFields) -> bool {
+        atoms.clear();
+        size_t offset = 0;
+        uint32_t atomCount = 0;
+        if (!readBinaryValue(data, size, offset, atomCount)) {
             return false;
         }
-        size_t required = static_cast<size_t>(atomNameLen) + static_cast<size_t>(residueNameLen);
-        if (offset + required > size) {
-            return false;
+        atoms.reserve(atomCount);
+        for (uint32_t i = 0; i < atomCount; i++) {
+            uint8_t atomNameLen = 0;
+            uint8_t residueNameLen = 0;
+            AtomCoordinate atom;
+            if (!readBinaryValue(data, size, offset, atomNameLen) ||
+                !readBinaryValue(data, size, offset, residueNameLen) ||
+                !readBinaryValue(data, size, offset, atom.atom_index) ||
+                !readBinaryValue(data, size, offset, atom.residue_index) ||
+                !readBinaryValue(data, size, offset, atom.coordinate.x) ||
+                !readBinaryValue(data, size, offset, atom.coordinate.y) ||
+                !readBinaryValue(data, size, offset, atom.coordinate.z) ||
+                !readBinaryValue(data, size, offset, atom.occupancy) ||
+                !readBinaryValue(data, size, offset, atom.tempFactor)) {
+                return false;
+            }
+            if (hasIdentityFields) {
+                if (!readBinaryValue(data, size, offset, atom.insertion_code) ||
+                    !readBinaryValue(data, size, offset, atom.altloc)) {
+                    return false;
+                }
+            } else {
+                atom.insertion_code = ' ';
+                atom.altloc = ' ';
+            }
+            size_t required = static_cast<size_t>(atomNameLen) + static_cast<size_t>(residueNameLen);
+            if (offset + required > size) {
+                return false;
+            }
+            atom.atom.assign(data + offset, data + offset + atomNameLen);
+            offset += atomNameLen;
+            atom.residue.assign(data + offset, data + offset + residueNameLen);
+            offset += residueNameLen;
+            atoms.push_back(std::move(atom));
         }
-        atom.atom.assign(data + offset, data + offset + atomNameLen);
-        offset += atomNameLen;
-        atom.residue.assign(data + offset, data + offset + residueNameLen);
-        offset += residueNameLen;
-        atoms.push_back(std::move(atom));
+        return offset == size;
+    };
+    if (parse(true)) {
+        return true;
     }
-    return offset == size;
+    return parse(false);
 }

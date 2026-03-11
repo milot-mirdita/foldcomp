@@ -36,6 +36,7 @@
 #include <cstring>
 #include <fstream> // IWYU pragma: keep
 #include <iomanip>
+#include <limits>
 #ifdef _WIN32
 #include <direct.h>
 #include "windows/getopt.h"
@@ -66,6 +67,7 @@ static int ext_plddt_digits = 1;
 static int ext_merge = 1;
 static int ext_use_title = 0;
 static int overwrite = 0;
+static float max_backbone_rmsd = std::numeric_limits<float>::infinity();
 
 static bool isMMCIFOutputPath(const std::string& path) {
     return stringEndsWith(".cif", path) ||
@@ -80,6 +82,14 @@ static bool isMMCIFOutputPath(const std::string& path) {
 static bool residueNeedsRawFallback(const tcb::span<const AtomCoordinate>& residueAtoms) {
     if (residueAtoms.empty()) {
         return false;
+    }
+    for (const auto& atom : residueAtoms) {
+        if (atom.altloc != ' ' && atom.altloc != '\0') {
+            return true;
+        }
+        if (atom.insertion_code != ' ' && atom.insertion_code != '\0') {
+            return true;
+        }
     }
     auto aaIt = Foldcomp::AAS.find(residueAtoms[0].residue);
     if (aaIt == Foldcomp::AAS.end()) {
@@ -134,6 +144,145 @@ static bool regionNeedsRawFallback(const tcb::span<AtomCoordinate>& atoms) {
     return false;
 }
 
+static bool shouldStoreSmallMixedFragmentAsRaw(
+    const tcb::span<AtomCoordinate>& chainSpan,
+    const std::vector<BackboneRegion>& regions
+) {
+    if (regions.size() <= 1) {
+        return false;
+    }
+    if (splitResidueRanges(chainSpan).size() > 24) {
+        return false;
+    }
+    for (const auto& region : regions) {
+        tcb::span<AtomCoordinate> regionSpan(
+            chainSpan.data() + region.start,
+            chainSpan.data() + region.end
+        );
+        if (!region.encodable || regionNeedsRawFallback(regionSpan)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+using RmsdResidueKey = std::tuple<int, std::string, int, int>;
+
+static std::map<RmsdResidueKey, std::vector<AtomCoordinate>> groupResiduesForRmsd(
+    const std::vector<AtomCoordinate>& atoms
+) {
+    std::map<RmsdResidueKey, std::vector<AtomCoordinate>> residues;
+    if (atoms.empty()) {
+        return residues;
+    }
+    std::map<std::tuple<int, std::string, int, char, std::string>, int> occurrences;
+    size_t residueStart = 0;
+    for (size_t i = 1; i <= atoms.size(); i++) {
+        bool endOfResidue = (i == atoms.size()) ||
+                            startsNewResidue(atoms[i], atoms[i - 1]);
+        if (!endOfResidue) {
+            continue;
+        }
+        const AtomCoordinate& first = atoms[residueStart];
+        std::tuple<int, std::string, int, char, std::string> baseKey(
+            first.model, first.chain, first.residue_index, first.insertion_code, first.residue
+        );
+        RmsdResidueKey key(
+            first.model, first.chain, first.residue_index, occurrences[baseKey]++
+        );
+        std::vector<AtomCoordinate>& residue = residues[key];
+        residue.insert(residue.end(), atoms.begin() + residueStart, atoms.begin() + i);
+        residueStart = i;
+    }
+    return residues;
+}
+
+static bool calculateAlignedRmsd(
+    const std::vector<AtomCoordinate>& atoms1,
+    const std::vector<AtomCoordinate>& atoms2,
+    float& backboneRmsd,
+    float& allAtomRmsd
+) {
+    backboneRmsd = 0.0f;
+    allAtomRmsd = 0.0f;
+    if (atoms1.empty() || atoms2.empty() || atoms1.size() != atoms2.size()) {
+        return false;
+    }
+
+    std::vector<AtomCoordinate> alignedAtoms1;
+    std::vector<AtomCoordinate> alignedAtoms2;
+    std::vector<AtomCoordinate> alignedBackbone1;
+    std::vector<AtomCoordinate> alignedBackbone2;
+
+    std::map<RmsdResidueKey, std::vector<AtomCoordinate>> residues1 = groupResiduesForRmsd(atoms1);
+    std::map<RmsdResidueKey, std::vector<AtomCoordinate>> residues2 = groupResiduesForRmsd(atoms2);
+    if (residues1.size() != residues2.size()) {
+        return false;
+    }
+
+    auto atomSorter = [](const AtomCoordinate& a, const AtomCoordinate& b) {
+        if (a.atom != b.atom) {
+            return a.atom < b.atom;
+        }
+        if (a.residue != b.residue) {
+            return a.residue < b.residue;
+        }
+        if (a.chain != b.chain) {
+            return a.chain < b.chain;
+        }
+        return a.atom_index < b.atom_index;
+    };
+
+    for (const auto& kv : residues1) {
+        auto it = residues2.find(kv.first);
+        if (it == residues2.end() || kv.second.empty() || it->second.empty()) {
+            return false;
+        }
+        const AtomCoordinate& left = kv.second.front();
+        const AtomCoordinate& right = it->second.front();
+        if (left.residue != right.residue || kv.second.size() != it->second.size()) {
+            return false;
+        }
+
+        std::vector<AtomCoordinate> sorted1 = kv.second;
+        std::vector<AtomCoordinate> sorted2 = it->second;
+        std::sort(sorted1.begin(), sorted1.end(), atomSorter);
+        std::sort(sorted2.begin(), sorted2.end(), atomSorter);
+        for (size_t atomIdx = 0; atomIdx < sorted1.size(); atomIdx++) {
+            if (sorted1[atomIdx].atom != sorted2[atomIdx].atom) {
+                return false;
+            }
+            alignedAtoms1.push_back(sorted1[atomIdx]);
+            alignedAtoms2.push_back(sorted2[atomIdx]);
+        }
+
+        auto appendBackboneAtom = [&](const std::string& atomName) {
+            auto leftIt = std::find_if(
+                sorted1.begin(), sorted1.end(),
+                [&](const AtomCoordinate& atom) { return atom.atom == atomName; }
+            );
+            auto rightIt = std::find_if(
+                sorted2.begin(), sorted2.end(),
+                [&](const AtomCoordinate& atom) { return atom.atom == atomName; }
+            );
+            if (leftIt != sorted1.end() && rightIt != sorted2.end()) {
+                alignedBackbone1.push_back(*leftIt);
+                alignedBackbone2.push_back(*rightIt);
+            }
+        };
+        appendBackboneAtom("N");
+        appendBackboneAtom("CA");
+        appendBackboneAtom("C");
+    }
+
+    if (alignedAtoms1.empty() || alignedBackbone1.empty()) {
+        return false;
+    }
+    backboneRmsd = RMSD(alignedBackbone1, alignedBackbone2);
+    allAtomRmsd = RMSD(alignedAtoms1, alignedAtoms2);
+    return true;
+}
+
 static std::string makeFragmentSuffix(const ContainerFragment& fragment, size_t index) {
     std::string suffix = "|m" + std::to_string(fragment.model);
     if (!fragment.chain.empty()) {
@@ -162,6 +311,7 @@ int print_usage(void) {
     std::cout << " -f, --file               input is a list of files [default=0]" << std::endl;
     std::cout << " -a, --alt                use alternative atom order [default=false]" << std::endl;
     std::cout << " -b, --break              interval size to save absolute atom coordinates [default=" << anchor_residue_threshold << "]" << std::endl;
+    std::cout << " --max-backbone-rmsd      if set, spill FCZ fragments above this backbone RMSD to raw [default=inf]" << std::endl;
     std::cout << " -z, --tar                save as tar file [default=false]" << std::endl;
     std::cout << " -d, --db                 save as database [default=false]" << std::endl;
     std::cout << " -y, --overwrite          overwrite existing files [default=false]" << std::endl;
@@ -210,110 +360,18 @@ int rmsd(const std::string& pdb1, const std::string& pdb2) {
         return 1;
     }
 
-    std::vector<AtomCoordinate> alignedAtoms1;
-    std::vector<AtomCoordinate> alignedAtoms2;
-    std::vector<AtomCoordinate> alignedBackbone1;
-    std::vector<AtomCoordinate> alignedBackbone2;
-
-    using ResidueKey = std::tuple<int, std::string, int, int>;
-    auto groupResiduesForRmsd = [](const std::vector<AtomCoordinate>& atoms) {
-        std::map<ResidueKey, std::vector<AtomCoordinate>> residues;
-        if (atoms.empty()) {
-            return residues;
-        }
-        std::map<std::tuple<int, std::string, int>, int> occurrences;
-        size_t residueStart = 0;
-        for (size_t i = 1; i <= atoms.size(); i++) {
-            bool endOfResidue = (i == atoms.size()) ||
-                                atoms[i].model != atoms[i - 1].model ||
-                                atoms[i].chain != atoms[i - 1].chain ||
-                                atoms[i].residue_index != atoms[i - 1].residue_index;
-            if (!endOfResidue) {
-                continue;
-            }
-            const AtomCoordinate& first = atoms[residueStart];
-            std::tuple<int, std::string, int> baseKey(
-                first.model, first.chain, first.residue_index
-            );
-            ResidueKey key(
-                first.model, first.chain, first.residue_index, occurrences[baseKey]++
-            );
-            std::vector<AtomCoordinate>& residue = residues[key];
-            residue.insert(residue.end(), atoms.begin() + residueStart, atoms.begin() + i);
-            residueStart = i;
-        }
-        return residues;
-    };
-
-    std::map<ResidueKey, std::vector<AtomCoordinate>> residues1 = groupResiduesForRmsd(atomCoordinates1);
-    std::map<ResidueKey, std::vector<AtomCoordinate>> residues2 = groupResiduesForRmsd(atomCoordinates2);
-    if (residues1.size() != residues2.size()) {
-        std::cerr << "[Error] Residue counts differ between the two files." << std::endl;
+    float backboneRmsd = 0.0f;
+    float allAtomRmsd = 0.0f;
+    if (!calculateAlignedRmsd(atomCoordinates1, atomCoordinates2, backboneRmsd, allAtomRmsd)) {
+        std::cerr << "[Error] Residue or atom identity mismatch between the two files." << std::endl;
         return 1;
-    }
-
-    auto atomSorter = [](const AtomCoordinate& a, const AtomCoordinate& b) {
-        if (a.atom != b.atom) {
-            return a.atom < b.atom;
-        }
-        if (a.residue != b.residue) {
-            return a.residue < b.residue;
-        }
-        if (a.chain != b.chain) {
-            return a.chain < b.chain;
-        }
-        return a.atom_index < b.atom_index;
-    };
-
-    for (const auto& kv : residues1) {
-        auto it = residues2.find(kv.first);
-        if (it == residues2.end() || kv.second.empty() || it->second.empty()) {
-            std::cerr << "[Error] Residue identity mismatch between the two files." << std::endl;
-            return 1;
-        }
-        const AtomCoordinate& left = kv.second.front();
-        const AtomCoordinate& right = it->second.front();
-        if (left.residue != right.residue || kv.second.size() != it->second.size()) {
-            std::cerr << "[Error] Residue identity mismatch between the two files." << std::endl;
-            return 1;
-        }
-
-        std::vector<AtomCoordinate> sorted1 = kv.second;
-        std::vector<AtomCoordinate> sorted2 = it->second;
-        std::sort(sorted1.begin(), sorted1.end(), atomSorter);
-        std::sort(sorted2.begin(), sorted2.end(), atomSorter);
-        for (size_t atomIdx = 0; atomIdx < sorted1.size(); atomIdx++) {
-            if (sorted1[atomIdx].atom != sorted2[atomIdx].atom) {
-                std::cerr << "[Error] Atom identity mismatch between the two files." << std::endl;
-                return 1;
-            }
-            alignedAtoms1.push_back(sorted1[atomIdx]);
-            alignedAtoms2.push_back(sorted2[atomIdx]);
-        }
-
-        auto appendBackboneAtom = [&](const std::string& atomName) {
-            auto leftIt = std::find_if(
-                sorted1.begin(), sorted1.end(),
-                [&](const AtomCoordinate& atom) { return atom.atom == atomName; }
-            );
-            auto rightIt = std::find_if(
-                sorted2.begin(), sorted2.end(),
-                [&](const AtomCoordinate& atom) { return atom.atom == atomName; }
-            );
-            if (leftIt != sorted1.end() && rightIt != sorted2.end()) {
-                alignedBackbone1.push_back(*leftIt);
-                alignedBackbone2.push_back(*rightIt);
-            }
-        };
-        appendBackboneAtom("N");
-        appendBackboneAtom("CA");
-        appendBackboneAtom("C");
     }
     // Print
     std::cout << pdb1 << '\t' << pdb2 << '\t';
-    std::cout << alignedBackbone1.size() / 3 << '\t' << alignedAtoms1.size() << '\t';
-    std::cout << RMSD(alignedBackbone1, alignedBackbone2) << '\t';
-    std::cout << RMSD(alignedAtoms1, alignedAtoms2) << std::endl;
+    std::map<RmsdResidueKey, std::vector<AtomCoordinate>> residues1 = groupResiduesForRmsd(atomCoordinates1);
+    std::cout << residues1.size() << '\t' << atomCoordinates1.size() << '\t';
+    std::cout << backboneRmsd << '\t';
+    std::cout << allAtomRmsd << std::endl;
     return 0;
 }
 
@@ -370,6 +428,7 @@ int main(int argc, char* const *argv) {
             {"version",            no_argument,                           0, 'v'},
             {"threads",      required_argument,                           0, 't'},
             {"break",        required_argument,                           0, 'b'},
+            {"max-backbone-rmsd", required_argument,                      0, 1000},
             {"id-list",      required_argument,                           0, 'l'},
             {"id-mode",      required_argument,                           0, 'm'},
             {"plddt-digits", required_argument,                           0, 'p'},
@@ -403,6 +462,9 @@ int main(int argc, char* const *argv) {
                 break;
             case 'b':
                 anchor_residue_threshold = atoi(optarg);
+                break;
+            case 1000:
+                max_backbone_rmsd = static_cast<float>(atof(optarg));
                 break;
             case 'l':
                 user_id_file = std::string(optarg);
@@ -657,8 +719,6 @@ int main(int argc, char* const *argv) {
                 // replace the title with only the base name if it was the same as the file name
                 std::string title = reader.title == base ? outputParts.first : reader.title;
 
-                removeAlternativePosition(atomCoordinates);
-
                 std::vector<ContainerFragment> encodedFragments;
                 std::vector<std::pair<size_t, size_t>> chain_indices = identifyChains(atomCoordinates);
                 // Check if there are multiple chains or regions with discontinous residue indices
@@ -684,12 +744,21 @@ int main(int argc, char* const *argv) {
                             std::cerr << "[Warning] Skipping empty fragment: " << base << std::endl;
                             continue;
                         }
-                        if (regions.size() > 1 ||
-                            regions[0].start != 0 ||
-                            regions[0].end != chain_span.size() ||
-                            !regions[0].encodable) {
-                            std::cerr << "[Warning] Using mixed encodings for unsupported residues: "
+                        if (shouldStoreSmallMixedFragmentAsRaw(chain_span, regions)) {
+                            std::cerr << "[Warning] Using raw encoding for short mixed fragment: "
                                       << base << std::endl;
+                            ContainerFragment containerFragment;
+                            containerFragment.kind = CONTAINER_FRAGMENT_KIND_RAW_ATOMS;
+                            containerFragment.model = chain_span.front().model;
+                            containerFragment.chain = chain_span.front().chain;
+                            if (!serializeAtomCoordinates(
+                                    tcb::span<const AtomCoordinate>(chain_span.data(), chain_span.size()),
+                                    containerFragment.payload)) {
+                                std::cerr << "[Error] Failed to serialize raw fragment: " << base << std::endl;
+                                return false;
+                            }
+                            encodedFragments.push_back(std::move(containerFragment));
+                            continue;
                         }
                         for (const auto& region : regions) {
                             tcb::span<AtomCoordinate> region_span(
@@ -716,6 +785,18 @@ int main(int argc, char* const *argv) {
                                     return false;
                                 }
                                 compData.clear();
+                                if (compRes.exceedsBackboneRmsdThreshold(max_backbone_rmsd)) {
+                                    std::cerr << "[Warning] Falling back to raw due to backbone RMSD threshold: "
+                                              << base << std::endl;
+                                    containerFragment.kind = CONTAINER_FRAGMENT_KIND_RAW_ATOMS;
+                                    containerFragment.payload.clear();
+                                    if (!serializeAtomCoordinates(
+                                            tcb::span<const AtomCoordinate>(region_span.data(), region_span.size()),
+                                            containerFragment.payload)) {
+                                        std::cerr << "[Error] Failed to serialize raw fragment: " << base << std::endl;
+                                        return false;
+                                    }
+                                }
                             } else {
                                 containerFragment.kind = CONTAINER_FRAGMENT_KIND_RAW_ATOMS;
                                 if (!serializeAtomCoordinates(

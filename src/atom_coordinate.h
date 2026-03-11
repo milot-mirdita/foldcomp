@@ -26,13 +26,13 @@ public:
         std::string a, std::string r, std::string c,
         int ai, int ri, float x, float y, float z,
         float occupancy = 0.0f, float tempFactor = 0.0f,
-        int model = 1
+        int model = 1, char insertionCode = ' ', char altloc = ' '
     );
     AtomCoordinate(
         std::string a, std::string r, std::string c,
         int ai, int ri, float3d coord,
         float occupancy = 0.0f, float tempFactor = 0.0f,
-        int model = 1
+        int model = 1, char insertionCode = ' ', char altloc = ' '
     );
     // data
     std::string atom;
@@ -44,6 +44,8 @@ public:
     float occupancy;
     float tempFactor;
     int model = 1;
+    char insertion_code = ' ';
+    char altloc = ' ';
 
     // operators
     bool operator==(const AtomCoordinate& other) const;
@@ -110,6 +112,7 @@ AtomCoordinate findFirstAtom(const std::vector<AtomCoordinate>& atoms, std::stri
 AtomCoordinate findFirstAtom(const tcb::span<const AtomCoordinate>& atoms, std::string atom_name);
 void setAtomIndexSequentially(std::vector<AtomCoordinate>& atoms, int start);
 void removeAlternativePosition(std::vector<AtomCoordinate>& atoms);
+bool startsNewResidue(const AtomCoordinate& current, const AtomCoordinate& previous);
 
 std::vector<AtomCoordinate> getAtomsWithResidueIndex(
     const tcb::span<AtomCoordinate>& atoms, int residue_index,

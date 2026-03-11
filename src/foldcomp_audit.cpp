@@ -309,20 +309,19 @@ std::map<ResidueKey, ResidueStats> groupResidues(const std::vector<AtomCoordinat
         return residues;
     }
 
-    std::map<std::tuple<int, std::string, int>, int> occurrences;
+    std::map<std::tuple<int, std::string, int, char, std::string>, int> occurrences;
     size_t residueStart = 0;
     for (size_t i = 1; i <= atoms.size(); i++) {
         bool endOfResidue = (i == atoms.size()) ||
-                            atoms[i].model != atoms[i - 1].model ||
-                            atoms[i].chain != atoms[i - 1].chain ||
-                            atoms[i].residue_index != atoms[i - 1].residue_index;
+                            startsNewResidue(atoms[i], atoms[i - 1]);
         if (!endOfResidue) {
             continue;
         }
 
         const AtomCoordinate& firstAtom = atoms[residueStart];
-        std::tuple<int, std::string, int> baseKey = std::make_tuple(
-            firstAtom.model, firstAtom.chain, firstAtom.residue_index
+        std::tuple<int, std::string, int, char, std::string> baseKey = std::make_tuple(
+            firstAtom.model, firstAtom.chain, firstAtom.residue_index,
+            firstAtom.insertion_code, firstAtom.residue
         );
         ResidueKey key = std::make_tuple(
             firstAtom.model, firstAtom.chain, firstAtom.residue_index,

@@ -19,6 +19,8 @@
 #include "torsion_angle.h"
 #include "utility.h"
 
+#include <cmath>
+
 #include <algorithm>
 #include <bitset>
 #include <cstdio>
@@ -926,8 +928,7 @@ std::vector<float> Foldcomp::checkTorsionReconstruction() {
     return output;
 }
 
-int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
-    // 2022-11-15 11:47:49 - Removed defining new vectors for TAs & BAs
+int Foldcomp::decompressBackbone(std::vector<AtomCoordinate>& atom) {
     int success;
     atom.clear();
     this->residues.clear();
@@ -1028,6 +1029,16 @@ int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
         );
     }
 
+    return success;
+}
+
+int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
+    // 2022-11-15 11:47:49 - Removed defining new vectors for TAs & BAs
+    int success = this->decompressBackbone(atom);
+    if (success != 0) {
+        return success;
+    }
+
     // Reconstruct sidechain
     std::vector<std::pair<size_t, size_t>> residueRanges = splitResidueRanges(atom);
     std::string currResidue = getThreeLetterCode(this->header.firstResidue);
@@ -1077,6 +1088,54 @@ int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
     setAtomIndexSequentially(atom, this->header.idxAtom);
 
     return success;
+}
+
+bool Foldcomp::exceedsBackboneRmsdThreshold(float maxBackboneRmsd) const {
+    if (!std::isfinite(maxBackboneRmsd)) {
+        return false;
+    }
+
+    Foldcomp decoded = *this;
+    decoded.anchorCoordinates.clear();
+    if (decoded.anchorAtoms.size() < 2) {
+        return true;
+    }
+    decoded.anchorCoordinates.reserve(decoded.anchorAtoms.size() - 1);
+    for (size_t i = 1; i < decoded.anchorAtoms.size(); ++i) {
+        const auto& anchorAtoms = decoded.anchorAtoms[i];
+        if (anchorAtoms.size() != 3) {
+            return true;
+        }
+        std::vector<std::vector<float>> coords;
+        coords.reserve(3);
+        for (const auto& atom : anchorAtoms) {
+            coords.push_back({
+                atom.coordinate.x,
+                atom.coordinate.y,
+                atom.coordinate.z
+            });
+        }
+        decoded.anchorCoordinates.push_back(std::move(coords));
+    }
+
+    std::vector<AtomCoordinate> decodedBackbone;
+    if (decoded.decompressBackbone(decodedBackbone) != 0) {
+        return true;
+    }
+    if (decodedBackbone.size() != this->backbone.size() || decodedBackbone.empty()) {
+        return true;
+    }
+    double sumSquaredDistance = 0.0;
+    for (size_t i = 0; i < decodedBackbone.size(); ++i) {
+        const float dx = this->backbone[i].coordinate.x - decodedBackbone[i].coordinate.x;
+        const float dy = this->backbone[i].coordinate.y - decodedBackbone[i].coordinate.y;
+        const float dz = this->backbone[i].coordinate.z - decodedBackbone[i].coordinate.z;
+        sumSquaredDistance += static_cast<double>(dx) * dx +
+                              static_cast<double>(dy) * dy +
+                              static_cast<double>(dz) * dz;
+    }
+    const float backboneRmsd = static_cast<float>(std::sqrt(sumSquaredDistance / decodedBackbone.size()));
+    return backboneRmsd > maxBackboneRmsd;
 }
 
 int Foldcomp::read(const char* data, size_t size) {

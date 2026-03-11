@@ -212,7 +212,12 @@ float _continuize(unsigned int input, float min, float cont_f);
 std::vector<AtomCoordinate> reconstructBackboneAtoms(
     const std::vector<AtomCoordinate>& prevAtoms,
     const std::vector<BackboneChain>& backbone,
-    const CompressedFileHeader& header
+    CompressedFileHeader& header
+);
+
+int reconstructBackboneReverse(
+    std::vector<AtomCoordinate>& atom, std::vector< std::vector<float> >& lastCoords,
+    std::vector<float>& torsion_angles, Nerf& nerf
 );
 
 std::vector<AtomCoordinate> reconstructSidechainAtoms(
@@ -377,7 +382,9 @@ public:
      // methods
     int preprocess(const tcb::span<AtomCoordinate>& atoms);
     std::vector<BackboneChain> compress(const tcb::span<AtomCoordinate>& atoms);
+    int decompressBackbone(std::vector<AtomCoordinate>& atoms);
     int decompress(std::vector<AtomCoordinate>& atoms);
+    bool exceedsBackboneRmsdThreshold(float maxBackboneRmsd) const;
     int read(const char* data, size_t size);
     int writeString(std::string& output);
     int write(std::string filename);

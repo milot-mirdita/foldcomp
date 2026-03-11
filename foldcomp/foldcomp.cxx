@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <limits>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -283,7 +284,7 @@ static PyObject *foldcomp_decompress(PyObject* /* self */, PyObject *args, PyObj
 // Compress
 int compress(
     const std::string& name, const std::string& pdb_input, const char* format,
-    std::string& output, int anchor_residue_threshold
+    std::string& output, int anchor_residue_threshold, float max_backbone_rmsd
 ) {
     std::vector<AtomCoordinate> atomCoordinates;
     int status = 0;
@@ -298,9 +299,26 @@ int compress(
     compRes.strTitle = name;
     compRes.anchorThreshold = anchor_residue_threshold;
     compRes.compress(atomCoordinates);
-    std::string encoded;
-    compRes.writeString(encoded);
-    output = std::move(encoded);
+    if (compRes.exceedsBackboneRmsdThreshold(max_backbone_rmsd)) {
+        ContainerFragment fragment;
+        fragment.kind = CONTAINER_FRAGMENT_KIND_RAW_ATOMS;
+        if (!atomCoordinates.empty()) {
+            fragment.model = atomCoordinates.front().model;
+            fragment.chain = atomCoordinates.front().chain;
+        }
+        if (!serializeAtomCoordinates(atomCoordinates, fragment.payload)) {
+            return PARSE_PDB_INVALID_FORMAT;
+        }
+        std::vector<ContainerFragment> fragments;
+        fragments.push_back(std::move(fragment));
+        if (!writeContainerToString(output, name, fragments)) {
+            return PARSE_PDB_INVALID_FORMAT;
+        }
+    } else {
+        std::string encoded;
+        compRes.writeString(encoded);
+        output = std::move(encoded);
+    }
 
     return 0;
 }
@@ -310,8 +328,9 @@ static PyObject *foldcomp_compress(PyObject* /* self */, PyObject *args, PyObjec
     const char* pdb_input;
     const char* format = "pdb";
     PyObject* anchor_residue_threshold = NULL;
-    static const char *kwlist[] = {"name", "pdb_content", "format", "anchor_residue_threshold", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "ss|$sO", const_cast<char**>(kwlist), &name, &pdb_input, &format, &anchor_residue_threshold)) {
+    PyObject* max_backbone_rmsd = NULL;
+    static const char *kwlist[] = {"name", "pdb_content", "format", "anchor_residue_threshold", "max_backbone_rmsd", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "ss|$sOO", const_cast<char**>(kwlist), &name, &pdb_input, &format, &anchor_residue_threshold, &max_backbone_rmsd)) {
         return NULL;
     }
 
@@ -319,14 +338,28 @@ static PyObject *foldcomp_compress(PyObject* /* self */, PyObject *args, PyObjec
         PyErr_SetString(PyExc_TypeError, "anchor_residue_threshold must be an integer");
         return NULL;
     }
+    if (max_backbone_rmsd != NULL &&
+        max_backbone_rmsd != Py_None &&
+        !PyFloat_Check(max_backbone_rmsd) &&
+        !PyLong_Check(max_backbone_rmsd)) {
+        PyErr_SetString(PyExc_TypeError, "max_backbone_rmsd must be a float");
+        return NULL;
+    }
 
     int threshold = DEFAULT_ANCHOR_THRESHOLD;
     if (anchor_residue_threshold != NULL) {
         threshold = PyLong_AsLong(anchor_residue_threshold);
     }
+    float maxBackboneRmsdValue = std::numeric_limits<float>::infinity();
+    if (max_backbone_rmsd != NULL && max_backbone_rmsd != Py_None) {
+        maxBackboneRmsdValue = static_cast<float>(PyFloat_AsDouble(max_backbone_rmsd));
+        if (PyErr_Occurred()) {
+            return NULL;
+        }
+    }
 
     std::string output;
-    int flag = compress(name, pdb_input, format, output, threshold);
+    int flag = compress(name, pdb_input, format, output, threshold, maxBackboneRmsdValue);
     if (flag == PARSE_PDB_NO_ATOM) {
         PyErr_SetString(FoldcompError, "No protein atoms found");
         return NULL;
