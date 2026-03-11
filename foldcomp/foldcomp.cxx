@@ -281,56 +281,18 @@ static PyObject *foldcomp_decompress(PyObject* /* self */, PyObject *args, PyObj
     return result;
 }
 
-// Compress
-int compress(
-    const std::string& name, const std::string& pdb_input, const char* format,
-    std::string& output, int anchor_residue_threshold, float max_backbone_rmsd
-) {
-    std::vector<AtomCoordinate> atomCoordinates;
-    int status = 0;
-    if (!parseStructureAtoms(pdb_input.data(), pdb_input.size(), true, atomCoordinates, status, nullptr, format)) {
-        return status;
-    }
-
-    removeAlternativePosition(atomCoordinates);
-
-    // compress
-    Foldcomp compRes;
-    compRes.strTitle = name;
-    compRes.anchorThreshold = anchor_residue_threshold;
-    compRes.compress(atomCoordinates);
-    if (compRes.exceedsBackboneRmsdThreshold(max_backbone_rmsd)) {
-        ContainerFragment fragment;
-        fragment.kind = CONTAINER_FRAGMENT_KIND_RAW_ATOMS;
-        if (!atomCoordinates.empty()) {
-            fragment.model = atomCoordinates.front().model;
-            fragment.chain = atomCoordinates.front().chain;
-        }
-        if (!serializeAtomCoordinates(atomCoordinates, fragment.payload)) {
-            return PARSE_PDB_INVALID_FORMAT;
-        }
-        std::vector<ContainerFragment> fragments;
-        fragments.push_back(std::move(fragment));
-        if (!writeContainerToString(output, name, fragments)) {
-            return PARSE_PDB_INVALID_FORMAT;
-        }
-    } else {
-        std::string encoded;
-        compRes.writeString(encoded);
-        output = std::move(encoded);
-    }
-
-    return 0;
-}
 // Python binding for compress
 static PyObject *foldcomp_compress(PyObject* /* self */, PyObject *args, PyObject* kwargs) {
     const char* name;
     const char* pdb_input;
+    Py_ssize_t pdb_input_size;
     const char* format = "pdb";
     PyObject* anchor_residue_threshold = NULL;
     PyObject* max_backbone_rmsd = NULL;
     static const char *kwlist[] = {"name", "pdb_content", "format", "anchor_residue_threshold", "max_backbone_rmsd", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "ss|$sOO", const_cast<char**>(kwlist), &name, &pdb_input, &format, &anchor_residue_threshold, &max_backbone_rmsd)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "ss#|$sOO", const_cast<char**>(kwlist),
+                                     &name, &pdb_input, &pdb_input_size, &format,
+                                     &anchor_residue_threshold, &max_backbone_rmsd)) {
         return NULL;
     }
 
@@ -359,7 +321,9 @@ static PyObject *foldcomp_compress(PyObject* /* self */, PyObject *args, PyObjec
     }
 
     std::string output;
-    int flag = compress(name, pdb_input, format, output, threshold, maxBackboneRmsdValue);
+    int flag = encodeStructureToFoldcomp(
+        name, pdb_input, static_cast<size_t>(pdb_input_size), format, threshold, maxBackboneRmsdValue, output
+    );
     if (flag == PARSE_PDB_NO_ATOM) {
         PyErr_SetString(FoldcompError, "No protein atoms found");
         return NULL;

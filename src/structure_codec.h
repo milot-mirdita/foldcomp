@@ -38,6 +38,15 @@ bool parseStructureAtoms(
     std::vector<AtomCoordinate>& atoms, int& status,
     std::string* title = nullptr, const char* format = nullptr
 );
+int encodeStructureToFoldcomp(
+    const std::string& title,
+    const char* data,
+    size_t size,
+    const char* format,
+    int anchorResidueThreshold,
+    float maxBackboneRmsd,
+    std::string& output
+);
 bool parsePDBAtoms(
     const char* data, size_t size, bool singleChainOnly,
     std::vector<AtomCoordinate>& atoms, int& status

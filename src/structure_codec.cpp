@@ -207,6 +207,49 @@ bool parseStructureAtoms(
 #endif
 }
 
+int encodeStructureToFoldcomp(
+    const std::string& title,
+    const char* data,
+    size_t size,
+    const char* format,
+    int anchorResidueThreshold,
+    float maxBackboneRmsd,
+    std::string& output
+) {
+    std::vector<AtomCoordinate> atomCoordinates;
+    int status = PARSE_PDB_OK;
+    if (!parseStructureAtoms(data, size, true, atomCoordinates, status, nullptr, format)) {
+        return status;
+    }
+
+    Foldcomp compRes;
+    compRes.strTitle = title;
+    compRes.anchorThreshold = anchorResidueThreshold;
+    compRes.compress(atomCoordinates);
+    if (compRes.exceedsBackboneRmsdThreshold(maxBackboneRmsd)) {
+        ContainerFragment fragment;
+        fragment.kind = CONTAINER_FRAGMENT_KIND_RAW_ATOMS;
+        if (!atomCoordinates.empty()) {
+            fragment.model = atomCoordinates.front().model;
+            fragment.chain = atomCoordinates.front().chain;
+        }
+        if (!serializeAtomCoordinates(atomCoordinates, fragment.payload)) {
+            return PARSE_PDB_INVALID_FORMAT;
+        }
+        std::vector<ContainerFragment> fragments;
+        fragments.push_back(std::move(fragment));
+        if (!writeContainerToString(output, title, fragments)) {
+            return PARSE_PDB_INVALID_FORMAT;
+        }
+    } else {
+        if (compRes.writeString(output) != 0) {
+            return PARSE_PDB_INVALID_FORMAT;
+        }
+    }
+
+    return PARSE_PDB_OK;
+}
+
 bool writeContainerToString(
     std::string& output, const std::string& title,
     const std::vector<ContainerFragment>& fragments
