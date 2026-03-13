@@ -380,9 +380,10 @@ std::vector<AtomCoordinate> Nerf::reconstructWithReversed(
         const AtomCoordinate& next_atom_in_forward = original_atoms[total - 3 - i];
         std::string curr_bond_name = curr_atom.atom + "_TO_" + next_atom_in_forward.atom;
         float curr_bond_length = this->bond_lengths.at(curr_bond_name);
-        float curr_bond_angle = atom_bond_angles[total - 4 - i];
+        size_t reverseIndex = total - 4 - i;
+        float curr_bond_angle = atom_bond_angles[reverseIndex];
         float3d curr_coord = place_atom(prev_coord, curr_bond_length, curr_bond_angle,
-            torsion_angles[total - 4 - i]);
+            torsion_angles[reverseIndex]);
         reconstructed_atoms.emplace_back(
             curr_atom.atom, curr_atom.residue, curr_atom.chain,
             curr_atom.atom_index, curr_atom.residue_index,

@@ -636,7 +636,7 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
     // Discretize
     this->phiDisc = Discretizer(this->phi, pow(2, NUM_BITS_PHI_PSI) - 1);
     this->phiDiscretized = this->phiDisc.discretize(this->phi);
-    this->omegaDisc = Discretizer(this->omega, pow(2, NUM_BITS_OMEGA) - 1);
+    this->omegaDisc = FixedAngleDiscretizer(pow(2, NUM_BITS_OMEGA) - 1);
     this->omegaDiscretized = this->omegaDisc.discretize(this->omega);
     this->psiDisc = Discretizer(this->psi, pow(2, NUM_BITS_PHI_PSI) - 1);
     this->psiDiscretized = this->psiDisc.discretize(this->psi);
@@ -959,7 +959,7 @@ int Foldcomp::decompressBackbone(std::vector<AtomCoordinate>& atom) {
     this->omega = this->omegaDisc.continuize(this->omegaDiscretized);
 
     // Append psi, omega, phi to torsion angles
-    for (size_t i = 0; i < (this->phi.size() - 1); i++) {
+    for (size_t i = 0; i < this->phi.size(); i++) {
         this->backboneTorsionAngles.push_back(this->psi[i]);
         this->backboneTorsionAngles.push_back(this->omega[i]);
         this->backboneTorsionAngles.push_back(this->phi[i]);
@@ -990,30 +990,23 @@ int Foldcomp::decompressBackbone(std::vector<AtomCoordinate>& atom) {
         }
         // std::vector<int>   sub(&data[100000],&data[101000]);
         // MANUALLY CHECK THAT THE INDICES ARE WITHIN BOUNDS
-        int maxIndex = (int)this->compressedBackBone.size() - 1;
-        size_t firstIndex = std::min(this->anchorIndices[i], maxIndex);
-        size_t lastIndex = std::min(this->anchorIndices[i + 1] + 1, maxIndex);
+        size_t compressedSize = this->compressedBackBone.size();
+        size_t firstIndex = std::min<size_t>(this->anchorIndices[i], compressedSize);
+        size_t lastIndexExclusive = std::min<size_t>(this->anchorIndices[i + 1] + 1, compressedSize);
         std::vector<BackboneChain> subBackbone(
-            &this->compressedBackBone[firstIndex],
-            &this->compressedBackBone[lastIndex]
+            this->compressedBackBone.begin() + firstIndex,
+            this->compressedBackBone.begin() + lastIndexExclusive
         );
-        // LAST RESIDUE SHOULD BE INCLUDED
-        if (i == (this->nAllAnchor - 2)) {
-            subBackbone.push_back(this->compressedBackBone.back());
-        }
         atomByAnchor = reconstructBackboneAtoms(prevForAnchor, subBackbone, this->header);
 
         // Subset torsion_angles
-        maxIndex = (int)this->backboneTorsionAngles.size() - 1;
-        firstIndex = std::min(this->anchorIndices[i] * 3, maxIndex);
-        lastIndex = std::min(this->anchorIndices[i + 1] * 3, maxIndex);
+        size_t torsionSize = this->backboneTorsionAngles.size();
+        firstIndex = std::min<size_t>(this->anchorIndices[i] * 3, torsionSize);
+        lastIndexExclusive = std::min<size_t>(this->anchorIndices[i + 1] * 3, torsionSize);
         std::vector<float> subTorsionAngles(
-            &this->backboneTorsionAngles[firstIndex], &this->backboneTorsionAngles[lastIndex]
+            this->backboneTorsionAngles.begin() + firstIndex,
+            this->backboneTorsionAngles.begin() + lastIndexExclusive
         );
-        // LAST ANGLE SHOULD BE APPENDED
-        if (i == (this->nAllAnchor - 2)) {
-            subTorsionAngles.push_back(this->backboneTorsionAngles.back());
-        }
 
         success = reconstructBackboneReverse(
             atomByAnchor, this->anchorCoordinates[i], subTorsionAngles, this->nerf
@@ -1090,21 +1083,17 @@ int Foldcomp::decompress(std::vector<AtomCoordinate>& atom) {
     return success;
 }
 
-bool Foldcomp::exceedsBackboneRmsdThreshold(float maxBackboneRmsd) const {
-    if (!std::isfinite(maxBackboneRmsd)) {
-        return false;
-    }
-
+float Foldcomp::computeBackboneRmsdForCompressedState() const {
     Foldcomp decoded = *this;
     decoded.anchorCoordinates.clear();
     if (decoded.anchorAtoms.size() < 2) {
-        return true;
+        return std::numeric_limits<float>::infinity();
     }
     decoded.anchorCoordinates.reserve(decoded.anchorAtoms.size() - 1);
     for (size_t i = 1; i < decoded.anchorAtoms.size(); ++i) {
         const auto& anchorAtoms = decoded.anchorAtoms[i];
         if (anchorAtoms.size() != 3) {
-            return true;
+            return std::numeric_limits<float>::infinity();
         }
         std::vector<std::vector<float>> coords;
         coords.reserve(3);
@@ -1120,10 +1109,10 @@ bool Foldcomp::exceedsBackboneRmsdThreshold(float maxBackboneRmsd) const {
 
     std::vector<AtomCoordinate> decodedBackbone;
     if (decoded.decompressBackbone(decodedBackbone) != 0) {
-        return true;
+        return std::numeric_limits<float>::infinity();
     }
     if (decodedBackbone.size() != this->backbone.size() || decodedBackbone.empty()) {
-        return true;
+        return std::numeric_limits<float>::infinity();
     }
     double sumSquaredDistance = 0.0;
     for (size_t i = 0; i < decodedBackbone.size(); ++i) {
@@ -1134,8 +1123,15 @@ bool Foldcomp::exceedsBackboneRmsdThreshold(float maxBackboneRmsd) const {
                               static_cast<double>(dy) * dy +
                               static_cast<double>(dz) * dz;
     }
-    const float backboneRmsd = static_cast<float>(std::sqrt(sumSquaredDistance / decodedBackbone.size()));
-    return backboneRmsd > maxBackboneRmsd;
+    return static_cast<float>(std::sqrt(sumSquaredDistance / decodedBackbone.size()));
+}
+
+bool Foldcomp::exceedsBackboneRmsdThreshold(float maxBackboneRmsd) const {
+    if (!std::isfinite(maxBackboneRmsd)) {
+        return false;
+    }
+    const double backboneRmsd = computeBackboneRmsdForCompressedState();
+    return backboneRmsd > static_cast<double>(maxBackboneRmsd);
 }
 
 int Foldcomp::read(const char* data, size_t size) {

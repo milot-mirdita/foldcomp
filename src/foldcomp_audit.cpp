@@ -4,12 +4,16 @@
 #include "foldcomp.h"
 #include "structure_codec.h"
 #include "structure_reader.h"
+#include "torsion_angle.h"
 #include "utility.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <map>
 #include <set>
 #include <sstream>
@@ -34,8 +38,42 @@ struct Summary {
 using ResidueKey = std::tuple<int, std::string, int, int>;
 namespace fs = std::filesystem;
 
+struct ParsedFczPayload {
+    CompressedFileHeader header{};
+    std::vector<int> anchorIndices;
+    std::string title;
+    std::vector<std::array<float, 3>> prevCoords;
+    std::vector<std::array<float, 3>> innerAnchorCoords;
+    std::vector<std::array<float, 3>> lastCoords;
+    char hasOXT = 0;
+    std::array<float, 3> oxtCoords{};
+    std::vector<BackboneChain> compressedBackbone;
+    std::vector<unsigned char> sideChainAngles;
+    float tempMin = 0.0f;
+    float tempContF = 0.0f;
+    std::vector<unsigned char> tempFactors;
+};
+
+struct HeaderFieldDiff {
+    std::string name;
+    std::string leftValue;
+    std::string rightValue;
+};
+
+struct TraceFragmentSelection {
+    int globalFragmentIndex = -1;
+    size_t chainRegionIndex = 0;
+    size_t discontinuityIndex = 0;
+    size_t regionIndex = 0;
+    bool useFoldcompEncoding = false;
+    std::vector<AtomCoordinate> regionAtoms;
+};
+
 Summary summarize(const std::vector<AtomCoordinate>& atoms);
 std::map<ResidueKey, ResidueStats> groupResidues(const std::vector<AtomCoordinate>& atoms);
+bool parseFczPayload(const std::string& payload, ParsedFczPayload& parsed);
+bool firstHeaderFieldDiff(const ParsedFczPayload& left, const ParsedFczPayload& right, HeaderFieldDiff& diff);
+bool findTraceFragment(const std::vector<AtomCoordinate>& atoms, int selectedFragmentIndex, TraceFragmentSelection& selection);
 
 enum class RawReason {
     NonProtein = 0,
@@ -69,9 +107,248 @@ const char* rawReasonName(RawReason reason) {
     return "unknown";
 }
 
+bool residueNeedsRawFallbackForTrace(const tcb::span<const AtomCoordinate>& residueAtoms) {
+    if (residueAtoms.empty()) {
+        return false;
+    }
+    for (const auto& atom : residueAtoms) {
+        if (atom.altloc != ' ' && atom.altloc != '\0') {
+            return true;
+        }
+        if (atom.insertion_code != ' ' && atom.insertion_code != '\0') {
+            return true;
+        }
+    }
+    auto aaIt = Foldcomp::AAS.find(residueAtoms[0].residue);
+    if (aaIt == Foldcomp::AAS.end()) {
+        return true;
+    }
+    std::set<std::string> sourceAtoms;
+    for (const auto& atom : residueAtoms) {
+        sourceAtoms.insert(atom.atom);
+    }
+    std::set<std::string> canonicalAtoms(aaIt->second.atoms.begin(), aaIt->second.atoms.end());
+    std::set<std::string> canonicalAtomsWithOxt = canonicalAtoms;
+    canonicalAtomsWithOxt.insert("OXT");
+    for (const auto& atom : sourceAtoms) {
+        if (canonicalAtomsWithOxt.find(atom) == canonicalAtomsWithOxt.end()) {
+            return true;
+        }
+    }
+    return sourceAtoms != canonicalAtoms && sourceAtoms != canonicalAtomsWithOxt;
+}
+
+bool regionNeedsRawFallbackForTrace(const tcb::span<AtomCoordinate>& atoms) {
+    std::vector<std::pair<size_t, size_t>> residues = splitResidueRanges(atoms);
+    size_t residuesWithOxt = 0;
+    for (size_t i = 0; i < residues.size(); i++) {
+        bool hasOxt = false;
+        for (size_t j = residues[i].first; j < residues[i].second; j++) {
+            if (atoms[j].atom == "OXT") {
+                hasOxt = true;
+                break;
+            }
+        }
+        if (!hasOxt) {
+            continue;
+        }
+        residuesWithOxt++;
+        if (i + 1 != residues.size()) {
+            return true;
+        }
+    }
+    if (residuesWithOxt > 1) {
+        return true;
+    }
+    for (const auto& residue : residues) {
+        if (residueNeedsRawFallbackForTrace(
+                tcb::span<const AtomCoordinate>(atoms.data() + residue.first, residue.second - residue.first))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool shouldStoreSmallMixedFragmentAsRawForTrace(
+    const tcb::span<AtomCoordinate>& chainSpan,
+    const std::vector<BackboneRegion>& regions
+) {
+    if (regions.size() <= 1) {
+        return false;
+    }
+    if (splitResidueRanges(chainSpan).size() > 24) {
+        return false;
+    }
+    for (const auto& region : regions) {
+        tcb::span<AtomCoordinate> regionSpan(
+            chainSpan.data() + region.start,
+            chainSpan.data() + region.end
+        );
+        if (!region.encodable || regionNeedsRawFallbackForTrace(regionSpan)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool decodeEntryToAtoms(const char* dataBuffer, size_t size, std::vector<AtomCoordinate>& atoms) {
     std::string title;
     return decodeStructureToAtoms(dataBuffer, size, false, title, atoms);
+}
+
+template <typename T>
+bool readBinaryValue(const char* data, size_t size, size_t& offset, T& out) {
+    if (offset + sizeof(T) > size) {
+        return false;
+    }
+    memcpy(&out, data + offset, sizeof(T));
+    offset += sizeof(T);
+    return true;
+}
+
+template <typename T>
+bool readBinarySpan(const char* data, size_t size, size_t& offset, T* out, size_t count) {
+    size_t bytes = sizeof(T) * count;
+    if (offset + bytes > size) {
+        return false;
+    }
+    memcpy(out, data + offset, bytes);
+    offset += bytes;
+    return true;
+}
+
+bool parseFczPayload(const std::string& payload, ParsedFczPayload& parsed) {
+    parsed = ParsedFczPayload{};
+    if (payload.size() < MAGICNUMBER_LENGTH + sizeof(CompressedFileHeader)) {
+        return false;
+    }
+    if (memcmp(payload.data(), MAGICNUMBER, MAGICNUMBER_LENGTH) != 0) {
+        return false;
+    }
+    size_t offset = MAGICNUMBER_LENGTH;
+    if (!readBinaryValue(payload.data(), payload.size(), offset, parsed.header)) {
+        return false;
+    }
+
+    parsed.anchorIndices.resize(parsed.header.nAnchor);
+    if (!parsed.anchorIndices.empty() &&
+        !readBinarySpan(payload.data(), payload.size(), offset,
+                        parsed.anchorIndices.data(), parsed.anchorIndices.size())) {
+        return false;
+    }
+
+    parsed.title.resize(parsed.header.lenTitle);
+    if (!parsed.title.empty() &&
+        !readBinarySpan(payload.data(), payload.size(), offset,
+                        parsed.title.data(), parsed.title.size())) {
+        return false;
+    }
+
+    parsed.prevCoords.resize(3);
+    if (!readBinarySpan(payload.data(), payload.size(), offset,
+                        parsed.prevCoords.data(), parsed.prevCoords.size())) {
+        return false;
+    }
+
+    size_t innerAnchorCount = parsed.header.nAnchor > 2 ? (parsed.header.nAnchor - 2) * 3 : 0;
+    parsed.innerAnchorCoords.resize(innerAnchorCount);
+    if (!parsed.innerAnchorCoords.empty() &&
+        !readBinarySpan(payload.data(), payload.size(), offset,
+                        parsed.innerAnchorCoords.data(), parsed.innerAnchorCoords.size())) {
+        return false;
+    }
+
+    parsed.lastCoords.resize(3);
+    if (!readBinarySpan(payload.data(), payload.size(), offset,
+                        parsed.lastCoords.data(), parsed.lastCoords.size())) {
+        return false;
+    }
+
+    if (!readBinaryValue(payload.data(), payload.size(), offset, parsed.hasOXT) ||
+        !readBinaryValue(payload.data(), payload.size(), offset, parsed.oxtCoords)) {
+        return false;
+    }
+
+    parsed.compressedBackbone.resize(parsed.header.nResidue);
+    if (!parsed.compressedBackbone.empty() &&
+        !readBinarySpan(payload.data(), payload.size(), offset,
+                        parsed.compressedBackbone.data(), parsed.compressedBackbone.size())) {
+        return false;
+    }
+
+    parsed.sideChainAngles.resize(parsed.header.nSideChainTorsion);
+    if (!parsed.sideChainAngles.empty() &&
+        !readBinarySpan(payload.data(), payload.size(), offset,
+                        parsed.sideChainAngles.data(), parsed.sideChainAngles.size())) {
+        return false;
+    }
+
+    if (!readBinaryValue(payload.data(), payload.size(), offset, parsed.tempMin) ||
+        !readBinaryValue(payload.data(), payload.size(), offset, parsed.tempContF)) {
+        return false;
+    }
+
+    parsed.tempFactors.resize(parsed.header.nResidue);
+    if (!parsed.tempFactors.empty() &&
+        !readBinarySpan(payload.data(), payload.size(), offset,
+                        parsed.tempFactors.data(), parsed.tempFactors.size())) {
+        return false;
+    }
+    return offset == payload.size();
+}
+
+template <typename T>
+std::string toStringValue(const T& value) {
+    std::ostringstream oss;
+    oss << value;
+    return oss.str();
+}
+
+std::string formatFloatTrace(float value) {
+    std::ostringstream oss;
+    uint32_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "float size mismatch");
+    memcpy(&bits, &value, sizeof(bits));
+    oss << std::setprecision(9) << value
+        << " bits=0x" << std::hex << std::setw(8) << std::setfill('0') << bits
+        << std::dec << std::setfill(' ');
+    return oss.str();
+}
+
+bool firstHeaderFieldDiff(const ParsedFczPayload& left, const ParsedFczPayload& right, HeaderFieldDiff& diff) {
+    auto setDiff = [&](const std::string& name, const auto& a, const auto& b) -> bool {
+        if (a == b) {
+            return false;
+        }
+        diff.name = name;
+        diff.leftValue = toStringValue(a);
+        diff.rightValue = toStringValue(b);
+        return true;
+    };
+
+    if (setDiff("nResidue", left.header.nResidue, right.header.nResidue)) return true;
+    if (setDiff("nAtom", left.header.nAtom, right.header.nAtom)) return true;
+    if (setDiff("idxResidue", left.header.idxResidue, right.header.idxResidue)) return true;
+    if (setDiff("idxAtom", left.header.idxAtom, right.header.idxAtom)) return true;
+    if (setDiff("nAnchor", static_cast<int>(left.header.nAnchor), static_cast<int>(right.header.nAnchor))) return true;
+    if (setDiff("chain", static_cast<int>(left.header.chain), static_cast<int>(right.header.chain))) return true;
+    if (setDiff("version", static_cast<int>(left.header.version), static_cast<int>(right.header.version))) return true;
+    if (setDiff("flags", static_cast<int>(left.header.flags), static_cast<int>(right.header.flags))) return true;
+    if (setDiff("nSideChainTorsion", left.header.nSideChainTorsion, right.header.nSideChainTorsion)) return true;
+    if (setDiff("firstResidue", static_cast<int>(left.header.firstResidue), static_cast<int>(right.header.firstResidue))) return true;
+    if (setDiff("lastResidue", static_cast<int>(left.header.lastResidue), static_cast<int>(right.header.lastResidue))) return true;
+    if (setDiff("chain2", static_cast<int>(left.header.chain2), static_cast<int>(right.header.chain2))) return true;
+    if (setDiff("chain3", static_cast<int>(left.header.chain3), static_cast<int>(right.header.chain3))) return true;
+    if (setDiff("lenTitle", left.header.lenTitle, right.header.lenTitle)) return true;
+    for (size_t i = 0; i < 6; i++) {
+        if (setDiff(std::string("mins[") + std::to_string(i) + "]",
+                    left.header.mins[i], right.header.mins[i])) return true;
+    }
+    for (size_t i = 0; i < 6; i++) {
+        if (setDiff(std::string("cont_fs[") + std::to_string(i) + "]",
+                    left.header.cont_fs[i], right.header.cont_fs[i])) return true;
+    }
+    return false;
 }
 
 std::string sourcePathToDbKey(const std::string& path) {
@@ -627,6 +904,583 @@ int commandFragmentReport(const std::string& sourcePath) {
     return 0;
 }
 
+bool findTraceFragment(const std::vector<AtomCoordinate>& atoms, int selectedFragmentIndex, TraceFragmentSelection& selection) {
+    int globalFragmentIndex = 0;
+    std::vector<std::pair<size_t, size_t>> chainRegions = identifyChains(atoms);
+    for (size_t chainIdx = 0; chainIdx < chainRegions.size(); chainIdx++) {
+        const auto& chainRegion = chainRegions[chainIdx];
+        std::vector<std::pair<size_t, size_t>> fragments = identifyDiscontinousResInd(
+            atoms, chainRegion.first, chainRegion.second
+        );
+        if (fragments.empty()) {
+            fragments.push_back(chainRegion);
+        }
+        for (size_t fragIdx = 0; fragIdx < fragments.size(); fragIdx++) {
+            const auto& fragment = fragments[fragIdx];
+            tcb::span<AtomCoordinate> chainSpan(
+                const_cast<AtomCoordinate*>(&atoms[fragment.first]), fragment.second - fragment.first
+            );
+            std::vector<BackboneRegion> regions = identifyBackboneRegions(chainSpan);
+            bool forceRawWholeChain = shouldStoreSmallMixedFragmentAsRawForTrace(chainSpan, regions);
+            for (size_t regionIdx = 0; regionIdx < regions.size(); regionIdx++, globalFragmentIndex++) {
+                if (globalFragmentIndex != selectedFragmentIndex) {
+                    continue;
+                }
+                const auto& region = regions[regionIdx];
+                tcb::span<AtomCoordinate> regionSpan(
+                    chainSpan.data() + region.start,
+                    chainSpan.data() + region.end
+                );
+                selection.globalFragmentIndex = globalFragmentIndex;
+                selection.chainRegionIndex = chainIdx;
+                selection.discontinuityIndex = fragIdx;
+                selection.regionIndex = regionIdx;
+                selection.useFoldcompEncoding = !forceRawWholeChain &&
+                                               region.encodable &&
+                                               !regionNeedsRawFallbackForTrace(regionSpan);
+                selection.regionAtoms.assign(regionSpan.begin(), regionSpan.end());
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+int commandTraceEncode(const std::string& sourcePath, int selectedFragmentIndex) {
+    StructureReader reader;
+    if (!reader.load(sourcePath)) {
+        std::cerr << "[Error] Failed to read source " << sourcePath << "\n";
+        return 1;
+    }
+    std::vector<AtomCoordinate> atoms;
+    reader.readAllAtoms(atoms);
+    if (atoms.empty()) {
+        std::cerr << "[Error] No protein atoms found in " << sourcePath << "\n";
+        return 1;
+    }
+
+    bool found = false;
+    std::vector<std::pair<size_t, size_t>> chainRegions = identifyChains(atoms);
+    int globalFragmentIndex = 0;
+    for (size_t chainIdx = 0; chainIdx < chainRegions.size(); chainIdx++) {
+        const auto& chainRegion = chainRegions[chainIdx];
+        std::vector<std::pair<size_t, size_t>> fragments = identifyDiscontinousResInd(
+            atoms, chainRegion.first, chainRegion.second
+        );
+        if (fragments.empty()) {
+            fragments.push_back(chainRegion);
+        }
+        for (size_t fragIdx = 0; fragIdx < fragments.size(); fragIdx++) {
+            const auto& fragment = fragments[fragIdx];
+            tcb::span<AtomCoordinate> chainSpan(
+                &atoms[fragment.first], atoms.data() + fragment.second
+            );
+            std::vector<BackboneRegion> regions = identifyBackboneRegions(chainSpan);
+            bool forceRawWholeChain = shouldStoreSmallMixedFragmentAsRawForTrace(chainSpan, regions);
+            for (size_t regionIdx = 0; regionIdx < regions.size(); regionIdx++, globalFragmentIndex++) {
+                const auto& region = regions[regionIdx];
+                tcb::span<AtomCoordinate> regionSpan(
+                    chainSpan.data() + region.start,
+                    chainSpan.data() + region.end
+                );
+                bool useFoldcompEncoding = !forceRawWholeChain &&
+                                           region.encodable &&
+                                           !regionNeedsRawFallbackForTrace(regionSpan);
+                if (selectedFragmentIndex >= 0 && globalFragmentIndex != selectedFragmentIndex) {
+                    continue;
+                }
+                found = true;
+                size_t startAtom = fragment.first + region.start;
+                size_t endAtom = fragment.first + region.end - 1;
+                std::cout << "fragment idx=" << globalFragmentIndex
+                          << " chain_region_idx=" << chainIdx
+                          << " discontinuity_idx=" << fragIdx
+                          << " region_idx=" << regionIdx
+                          << " kind=" << (useFoldcompEncoding ? "fcz" : "raw")
+                          << " chain=" << atoms[startAtom].chain
+                          << " model=" << atoms[startAtom].model
+                          << " start_atom=" << startAtom
+                          << " end_atom=" << endAtom
+                          << " start_resid=" << atoms[startAtom].residue_index
+                          << " end_resid=" << atoms[endAtom].residue_index
+                          << " atom_count=" << regionSpan.size()
+                          << "\n";
+                if (!useFoldcompEncoding) {
+                    continue;
+                }
+
+                Foldcomp compRes;
+                compRes.compress(regionSpan);
+                std::cout << "header idxResidue=" << compRes.header.idxResidue
+                          << " nResidue=" << compRes.header.nResidue
+                          << " idxAtom=" << compRes.header.idxAtom
+                          << " nAtom=" << compRes.header.nAtom
+                          << " nAnchor=" << static_cast<int>(compRes.header.nAnchor)
+                          << " nSideChainTorsion=" << compRes.header.nSideChainTorsion
+                          << "\n";
+                std::cout << "mins";
+                for (int i = 0; i < 6; i++) {
+                    std::cout << " [" << i << "]=" << formatFloatTrace(compRes.header.mins[i]);
+                }
+                std::cout << "\n";
+                std::cout << "cont_fs";
+                for (int i = 0; i < 6; i++) {
+                    std::cout << " [" << i << "]=" << formatFloatTrace(compRes.header.cont_fs[i]);
+                }
+                std::cout << "\n";
+                std::cout << "anchor_indices";
+                for (int anchorIndex : compRes.anchorIndices) {
+                    std::cout << " " << anchorIndex;
+                }
+                std::cout << "\n";
+
+                for (size_t i = 0; i < compRes.compressedBackBone.size(); i++) {
+                    const BackboneChain& bb = compRes.compressedBackBone[i];
+                    std::string residue3 = i < compRes.residueThreeLetter.size() ? compRes.residueThreeLetter[i] : "";
+                    std::cout << "bb idx=" << i
+                              << " residue=" << residue3
+                              << " residue_disc=" << bb.residue;
+                    if (i < compRes.phi.size()) {
+                        std::cout << " phi=" << formatFloatTrace(compRes.phi[i])
+                                  << " phi_disc=" << compRes.phiDiscretized[i]
+                                  << " psi=" << formatFloatTrace(compRes.psi[i])
+                                  << " psi_disc=" << compRes.psiDiscretized[i]
+                                  << " omega=" << formatFloatTrace(compRes.omega[i])
+                                  << " omega_disc=" << compRes.omegaDiscretized[i]
+                                  << " n_ca_c=" << formatFloatTrace(compRes.n_ca_c_angle[i])
+                                  << " n_ca_c_disc=" << compRes.n_ca_c_angleDiscretized[i]
+                                  << " ca_c_n=" << formatFloatTrace(compRes.ca_c_n_angle[i])
+                                  << " ca_c_n_disc=" << compRes.ca_c_n_angleDiscretized[i]
+                                  << " c_n_ca=" << formatFloatTrace(compRes.c_n_ca_angle[i])
+                                  << " c_n_ca_disc=" << compRes.c_n_ca_angleDiscretized[i];
+                    } else {
+                        std::cout << " terminal=1";
+                    }
+                    std::cout << "\n";
+                }
+
+                size_t sidechainFlatIndex = 0;
+                for (size_t residueIndex = 0; residueIndex < compRes.sideChainAnglesPerResidue.size(); residueIndex++) {
+                    for (size_t torsionIndex = 0; torsionIndex < compRes.sideChainAnglesPerResidue[residueIndex].size(); torsionIndex++, sidechainFlatIndex++) {
+                        std::cout << "sc residue_idx=" << residueIndex
+                                  << " torsion_idx=" << torsionIndex
+                                  << " value=" << formatFloatTrace(compRes.sideChainAnglesPerResidue[residueIndex][torsionIndex]);
+                        if (sidechainFlatIndex < compRes.sideChainAnglesDiscretized.size()) {
+                            std::cout << " disc=" << compRes.sideChainAnglesDiscretized[sidechainFlatIndex];
+                        }
+                        std::cout << "\n";
+                    }
+                }
+
+                for (size_t i = 0; i < compRes.tempFactors.size(); i++) {
+                    std::cout << "tf idx=" << i
+                              << " value=" << formatFloatTrace(compRes.tempFactors[i]);
+                    if (i < compRes.tempFactorsDiscretized.size()) {
+                        std::cout << " disc=" << compRes.tempFactorsDiscretized[i];
+                    }
+                    std::cout << "\n";
+                }
+            }
+        }
+    }
+    if (!found) {
+        std::cerr << "[Error] Fragment index " << selectedFragmentIndex << " not found\n";
+        return 1;
+    }
+    return 0;
+}
+
+int commandTraceTorsionOp(const std::string& sourcePath, int selectedFragmentIndex, int torsionIndex) {
+    StructureReader reader;
+    if (!reader.load(sourcePath)) {
+        std::cerr << "[Error] Failed to read source " << sourcePath << "\n";
+        return 1;
+    }
+    std::vector<AtomCoordinate> atoms;
+    reader.readAllAtoms(atoms);
+    if (atoms.empty()) {
+        std::cerr << "[Error] No protein atoms found in " << sourcePath << "\n";
+        return 1;
+    }
+
+    TraceFragmentSelection selection;
+    if (!findTraceFragment(atoms, selectedFragmentIndex, selection)) {
+        std::cerr << "[Error] Fragment index " << selectedFragmentIndex << " not found\n";
+        return 1;
+    }
+    if (!selection.useFoldcompEncoding) {
+        std::cerr << "[Error] Fragment index " << selectedFragmentIndex << " is not FCZ-encodable\n";
+        return 1;
+    }
+
+    Foldcomp compRes;
+    compRes.compress(selection.regionAtoms);
+    std::vector<float> torsionVector = getTorsionFromXYZ(compRes.backbone, 1);
+    if (torsionIndex < 0 || static_cast<size_t>(torsionIndex + 3) >= compRes.backbone.size()) {
+        std::cerr << "[Error] torsion_index out of range for fragment\n";
+        return 1;
+    }
+
+    const float3d atm1 = compRes.backbone[torsionIndex + 0].coordinate;
+    const float3d atm2 = compRes.backbone[torsionIndex + 1].coordinate;
+    const float3d atm3 = compRes.backbone[torsionIndex + 2].coordinate;
+    const float3d atm4 = compRes.backbone[torsionIndex + 3].coordinate;
+    const float3d d1{atm2.x - atm1.x, atm2.y - atm1.y, atm2.z - atm1.z};
+    const float3d d2{atm3.x - atm2.x, atm3.y - atm2.y, atm3.z - atm2.z};
+    const float3d d3{atm4.x - atm3.x, atm4.y - atm3.y, atm4.z - atm3.z};
+    const float3d u1 = crossProduct(d1, d2);
+    const float3d u2 = crossProduct(d2, d3);
+    const float d2Norm = norm(d2);
+    const float x = dotProduct(u1, u2);
+    const float3d planeBetaVec = crossProduct(u2, d2);
+    const float y = d2Norm > FLOAT3D_EPSILON ? dotProduct(u1, planeBetaVec) / d2Norm : 0.0f;
+    const TorsionTrace inlineTrace = computeTorsionTraceFromCoords(atm1, atm2, atm3, atm4);
+    const TorsionTrace runtimeTrace = computeTorsionTraceRuntime(atm1, atm2, atm3, atm4);
+    const float torsionAngle = inlineTrace.angle;
+    const int angleKind = torsionIndex % 3;
+    const int residueIndex = torsionIndex / 3 + (angleKind == 2 ? 1 : 0);
+    const int storedIndex = torsionIndex / 3;
+    const char* angleName = angleKind == 0 ? "psi" : (angleKind == 1 ? "omega" : "phi");
+
+    auto printVec = [](const char* name, const float3d& value) {
+        std::cout << name
+                  << " x=" << formatFloatTrace(value.x)
+                  << " y=" << formatFloatTrace(value.y)
+                  << " z=" << formatFloatTrace(value.z)
+                  << "\n";
+    };
+
+    std::cout << "fragment idx=" << selection.globalFragmentIndex
+              << " torsion_index=" << torsionIndex
+              << " angle=" << angleName
+              << " residue_idx=" << residueIndex
+              << "\n";
+    printVec("atm1", atm1);
+    printVec("atm2", atm2);
+    printVec("atm3", atm3);
+    printVec("atm4", atm4);
+    printVec("d1", d1);
+    printVec("d2", d2);
+    printVec("d3", d3);
+    printVec("u1", u1);
+    printVec("u2", u2);
+    printVec("plane_beta_vec", planeBetaVec);
+    std::cout << "d2_norm=" << formatFloatTrace(d2Norm) << "\n";
+    std::cout << "x=" << formatFloatTrace(x) << "\n";
+    std::cout << "y=" << formatFloatTrace(y) << "\n";
+    std::cout << "inline_trace d2_norm=" << formatFloatTrace(inlineTrace.d2Norm)
+              << " x=" << formatFloatTrace(inlineTrace.x)
+              << " y=" << formatFloatTrace(inlineTrace.y)
+              << " angle=" << formatFloatTrace(inlineTrace.angle)
+              << "\n";
+    std::cout << "runtime_trace d2_norm=" << formatFloatTrace(runtimeTrace.d2Norm)
+              << " x=" << formatFloatTrace(runtimeTrace.x)
+              << " y=" << formatFloatTrace(runtimeTrace.y)
+              << " angle=" << formatFloatTrace(runtimeTrace.angle)
+              << "\n";
+    if (angleKind == 0 && static_cast<size_t>(storedIndex) < compRes.psi.size()) {
+        std::cout << "stored_angle=" << formatFloatTrace(compRes.psi[storedIndex]) << "\n";
+    } else if (angleKind == 1 && static_cast<size_t>(storedIndex) < compRes.omega.size()) {
+        std::cout << "stored_angle=" << formatFloatTrace(compRes.omega[storedIndex]) << "\n";
+    } else if (angleKind == 2 && static_cast<size_t>(storedIndex) < compRes.phi.size()) {
+        std::cout << "stored_angle=" << formatFloatTrace(compRes.phi[storedIndex]) << "\n";
+    }
+    if (static_cast<size_t>(torsionIndex) < torsionVector.size()) {
+        std::cout << "function_angle=" << formatFloatTrace(torsionVector[torsionIndex]) << "\n";
+    }
+    std::cout << "torsion_angle=" << formatFloatTrace(torsionAngle) << "\n";
+    return 0;
+}
+
+int commandEncodedDiff(const std::string& leftPath, const std::string& rightPath) {
+    std::string leftData;
+    std::string rightData;
+    {
+        std::ifstream input(leftPath, std::ios::binary);
+        if (!input) {
+            std::cerr << "[Error] Failed to read " << leftPath << "\n";
+            return 1;
+        }
+        leftData.assign((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    }
+    {
+        std::ifstream input(rightPath, std::ios::binary);
+        if (!input) {
+            std::cerr << "[Error] Failed to read " << rightPath << "\n";
+            return 1;
+        }
+        rightData.assign((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    }
+    if (leftData.empty()) {
+        std::cerr << "[Error] Failed to read " << leftPath << "\n";
+        return 1;
+    }
+    if (rightData.empty()) {
+        std::cerr << "[Error] Failed to read " << rightPath << "\n";
+        return 1;
+    }
+
+    std::string leftTitle;
+    std::string rightTitle;
+    std::vector<ContainerFragment> leftFragments;
+    std::vector<ContainerFragment> rightFragments;
+    bool leftContainer = readContainer(leftData.data(), leftData.size(), leftTitle, leftFragments);
+    bool rightContainer = readContainer(rightData.data(), rightData.size(), rightTitle, rightFragments);
+
+    if (!leftContainer) {
+        ContainerFragment fragment;
+        fragment.kind = CONTAINER_FRAGMENT_KIND_FCZ;
+        fragment.payload = leftData;
+        leftFragments.push_back(std::move(fragment));
+    }
+    if (!rightContainer) {
+        ContainerFragment fragment;
+        fragment.kind = CONTAINER_FRAGMENT_KIND_FCZ;
+        fragment.payload = rightData;
+        rightFragments.push_back(std::move(fragment));
+    }
+
+    std::cout << "left_container=" << (leftContainer ? 1 : 0)
+              << " right_container=" << (rightContainer ? 1 : 0)
+              << " left_fragments=" << leftFragments.size()
+              << " right_fragments=" << rightFragments.size()
+              << "\n";
+
+    size_t fragmentCount = std::min(leftFragments.size(), rightFragments.size());
+    for (size_t i = 0; i < fragmentCount; i++) {
+        const auto& leftFragment = leftFragments[i];
+        const auto& rightFragment = rightFragments[i];
+        bool samePayload = leftFragment.payload == rightFragment.payload;
+        size_t firstByteDiff = 0;
+        bool hasFirstByteDiff = false;
+        size_t payloadCompareCount = std::min(leftFragment.payload.size(), rightFragment.payload.size());
+        for (size_t j = 0; j < payloadCompareCount; j++) {
+            if (leftFragment.payload[j] != rightFragment.payload[j]) {
+                firstByteDiff = j;
+                hasFirstByteDiff = true;
+                break;
+            }
+        }
+        std::cout << "fragment idx=" << i
+                  << " left_kind=" << static_cast<int>(leftFragment.kind)
+                  << " right_kind=" << static_cast<int>(rightFragment.kind)
+                  << " left_model=" << leftFragment.model
+                  << " right_model=" << rightFragment.model
+                  << " left_chain=" << leftFragment.chain
+                  << " right_chain=" << rightFragment.chain
+                  << " same_payload=" << (samePayload ? 1 : 0)
+                  << " left_size=" << leftFragment.payload.size()
+                  << " right_size=" << rightFragment.payload.size();
+        if (hasFirstByteDiff) {
+            std::cout << " first_payload_byte_diff=" << firstByteDiff;
+        }
+        std::cout
+                  << "\n";
+        if (samePayload || leftFragment.kind != CONTAINER_FRAGMENT_KIND_FCZ ||
+            rightFragment.kind != CONTAINER_FRAGMENT_KIND_FCZ) {
+            continue;
+        }
+
+        ParsedFczPayload leftParsed;
+        ParsedFczPayload rightParsed;
+        if (!parseFczPayload(leftFragment.payload, leftParsed) ||
+            !parseFczPayload(rightFragment.payload, rightParsed)) {
+            std::cout << "fragment_parse_failed idx=" << i << "\n";
+            continue;
+        }
+
+        std::cout << "fcz idx=" << i
+                  << " left_nResidue=" << leftParsed.header.nResidue
+                  << " right_nResidue=" << rightParsed.header.nResidue
+                  << " left_nAtom=" << leftParsed.header.nAtom
+                  << " right_nAtom=" << rightParsed.header.nAtom
+                  << " left_nAnchor=" << static_cast<int>(leftParsed.header.nAnchor)
+                  << " right_nAnchor=" << static_cast<int>(rightParsed.header.nAnchor)
+                  << " left_nSideChain=" << leftParsed.header.nSideChainTorsion
+                  << " right_nSideChain=" << rightParsed.header.nSideChainTorsion
+                  << "\n";
+
+        size_t headerByteDiffs = 0;
+        const unsigned char* leftHeaderBytes = reinterpret_cast<const unsigned char*>(&leftParsed.header);
+        const unsigned char* rightHeaderBytes = reinterpret_cast<const unsigned char*>(&rightParsed.header);
+        for (size_t j = 0; j < sizeof(CompressedFileHeader); j++) {
+            if (leftHeaderBytes[j] != rightHeaderBytes[j]) {
+                headerByteDiffs++;
+            }
+        }
+        if (headerByteDiffs > 0) {
+            std::cout << "header_byte_diffs=" << headerByteDiffs << "\n";
+            HeaderFieldDiff fieldDiff;
+            if (firstHeaderFieldDiff(leftParsed, rightParsed, fieldDiff)) {
+                std::cout << "first_header_field_diff name=" << fieldDiff.name
+                          << " left=" << fieldDiff.leftValue
+                          << " right=" << fieldDiff.rightValue
+                          << "\n";
+            }
+        }
+
+        size_t backboneDiffResidues = 0;
+        size_t residueDiff = 0;
+        size_t phiDiff = 0;
+        size_t psiDiff = 0;
+        size_t omegaDiff = 0;
+        size_t nCaCDiff = 0;
+        size_t caCNDiff = 0;
+        size_t cNCaDiff = 0;
+        std::vector<std::string> examples;
+        size_t backboneCount = std::min(leftParsed.compressedBackbone.size(), rightParsed.compressedBackbone.size());
+        for (size_t j = 0; j < backboneCount; j++) {
+            const BackboneChain& leftBb = leftParsed.compressedBackbone[j];
+            const BackboneChain& rightBb = rightParsed.compressedBackbone[j];
+            bool differs = false;
+            std::string firstFieldName;
+            std::string firstFieldLeft;
+            std::string firstFieldRight;
+            if (leftBb.residue != rightBb.residue) {
+                residueDiff++;
+                differs = true;
+                if (firstFieldName.empty()) {
+                    firstFieldName = "residue";
+                    firstFieldLeft = toStringValue(static_cast<int>(leftBb.residue));
+                    firstFieldRight = toStringValue(static_cast<int>(rightBb.residue));
+                }
+            }
+            if (leftBb.phi != rightBb.phi) {
+                phiDiff++;
+                differs = true;
+                if (firstFieldName.empty()) {
+                    firstFieldName = "phi";
+                    firstFieldLeft = toStringValue(leftBb.phi);
+                    firstFieldRight = toStringValue(rightBb.phi);
+                }
+            }
+            if (leftBb.psi != rightBb.psi) {
+                psiDiff++;
+                differs = true;
+                if (firstFieldName.empty()) {
+                    firstFieldName = "psi";
+                    firstFieldLeft = toStringValue(leftBb.psi);
+                    firstFieldRight = toStringValue(rightBb.psi);
+                }
+            }
+            if (leftBb.omega != rightBb.omega) {
+                omegaDiff++;
+                differs = true;
+                if (firstFieldName.empty()) {
+                    firstFieldName = "omega";
+                    firstFieldLeft = toStringValue(leftBb.omega);
+                    firstFieldRight = toStringValue(rightBb.omega);
+                }
+            }
+            if (leftBb.n_ca_c_angle != rightBb.n_ca_c_angle) {
+                nCaCDiff++;
+                differs = true;
+                if (firstFieldName.empty()) {
+                    firstFieldName = "n_ca_c_angle";
+                    firstFieldLeft = toStringValue(leftBb.n_ca_c_angle);
+                    firstFieldRight = toStringValue(rightBb.n_ca_c_angle);
+                }
+            }
+            if (leftBb.ca_c_n_angle != rightBb.ca_c_n_angle) {
+                caCNDiff++;
+                differs = true;
+                if (firstFieldName.empty()) {
+                    firstFieldName = "ca_c_n_angle";
+                    firstFieldLeft = toStringValue(leftBb.ca_c_n_angle);
+                    firstFieldRight = toStringValue(rightBb.ca_c_n_angle);
+                }
+            }
+            if (leftBb.c_n_ca_angle != rightBb.c_n_ca_angle) {
+                cNCaDiff++;
+                differs = true;
+                if (firstFieldName.empty()) {
+                    firstFieldName = "c_n_ca_angle";
+                    firstFieldLeft = toStringValue(leftBb.c_n_ca_angle);
+                    firstFieldRight = toStringValue(rightBb.c_n_ca_angle);
+                }
+            }
+            if (differs) {
+                backboneDiffResidues++;
+                if (examples.size() < 10) {
+                    std::ostringstream oss;
+                    oss << "residue_idx=" << j
+                        << " first_field=" << firstFieldName
+                        << " first_left=" << firstFieldLeft
+                        << " first_right=" << firstFieldRight
+                        << " res_left=" << static_cast<int>(leftBb.residue)
+                        << " res_right=" << static_cast<int>(rightBb.residue)
+                        << " phi=" << leftBb.phi << "/" << rightBb.phi
+                        << " psi=" << leftBb.psi << "/" << rightBb.psi
+                        << " omega=" << leftBb.omega << "/" << rightBb.omega
+                        << " n_ca_c=" << leftBb.n_ca_c_angle << "/" << rightBb.n_ca_c_angle
+                        << " ca_c_n=" << leftBb.ca_c_n_angle << "/" << rightBb.ca_c_n_angle
+                        << " c_n_ca=" << leftBb.c_n_ca_angle << "/" << rightBb.c_n_ca_angle;
+                    examples.push_back(oss.str());
+                }
+            }
+        }
+        std::cout << "backbone_diff_residues=" << backboneDiffResidues
+                  << " residue_field_diff=" << residueDiff
+                  << " phi_diff=" << phiDiff
+                  << " psi_diff=" << psiDiff
+                  << " omega_diff=" << omegaDiff
+                  << " n_ca_c_diff=" << nCaCDiff
+                  << " ca_c_n_diff=" << caCNDiff
+                  << " c_n_ca_diff=" << cNCaDiff
+                  << "\n";
+        for (const std::string& example : examples) {
+            std::cout << "backbone_diff_example " << example << "\n";
+        }
+
+        if (leftParsed.sideChainAngles != rightParsed.sideChainAngles) {
+            size_t diffCount = 0;
+            size_t count = std::min(leftParsed.sideChainAngles.size(), rightParsed.sideChainAngles.size());
+            size_t firstDiffIndex = count;
+            for (size_t j = 0; j < count; j++) {
+                if (leftParsed.sideChainAngles[j] != rightParsed.sideChainAngles[j]) {
+                    if (firstDiffIndex == count) {
+                        firstDiffIndex = j;
+                    }
+                    diffCount++;
+                }
+            }
+            std::cout << "sidechain_diff_values=" << diffCount;
+            if (firstDiffIndex != count) {
+                std::cout << " first_sidechain_diff_index=" << firstDiffIndex
+                          << " left=" << static_cast<int>(leftParsed.sideChainAngles[firstDiffIndex])
+                          << " right=" << static_cast<int>(rightParsed.sideChainAngles[firstDiffIndex]);
+            }
+            std::cout << "\n";
+        }
+        if (leftParsed.tempFactors != rightParsed.tempFactors) {
+            size_t diffCount = 0;
+            size_t count = std::min(leftParsed.tempFactors.size(), rightParsed.tempFactors.size());
+            size_t firstDiffIndex = count;
+            for (size_t j = 0; j < count; j++) {
+                if (leftParsed.tempFactors[j] != rightParsed.tempFactors[j]) {
+                    if (firstDiffIndex == count) {
+                        firstDiffIndex = j;
+                    }
+                    diffCount++;
+                }
+            }
+            std::cout << "tempfactor_diff_values=" << diffCount;
+            if (firstDiffIndex != count) {
+                std::cout << " first_tempfactor_diff_index=" << firstDiffIndex
+                          << " left=" << static_cast<int>(leftParsed.tempFactors[firstDiffIndex])
+                          << " right=" << static_cast<int>(rightParsed.tempFactors[firstDiffIndex]);
+            }
+            std::cout << "\n";
+        }
+    }
+
+    if (leftFragments.size() != rightFragments.size()) {
+        std::cout << "fragment_count_diff left=" << leftFragments.size()
+                  << " right=" << rightFragments.size() << "\n";
+    }
+    return 0;
+}
+
 int commandContainerReport(const std::string& encodedPath) {
     std::ifstream input(encodedPath, std::ios::binary);
     if (!input) {
@@ -840,12 +1694,15 @@ int main(int argc, char** argv) {
         std::cerr << "Usage:\n"
                   << "  foldcomp_audit summarize <structure>\n"
                   << "  foldcomp_audit compare <source_structure> <roundtrip_structure>\n"
+                  << "  foldcomp_audit encoded-diff <left_encoded> <right_encoded>\n"
                   << "  foldcomp_audit fallback-report <structure_or_directory>\n"
                   << "  foldcomp_audit db-compare [--recursive] <source_directory> <db>\n"
                   << "  foldcomp_audit db-entry-compare <source_structure> <db>\n"
                   << "  foldcomp_audit dump-residues <structure>\n"
                   << "  foldcomp_audit db-entry-dump-residues <source_structure> <db>\n"
                   << "  foldcomp_audit fragment-report <structure>\n"
+                  << "  foldcomp_audit trace-encode <structure> [fragment_idx]\n"
+                  << "  foldcomp_audit trace-torsion-op <structure> <fragment_idx> <torsion_idx>\n"
                   << "  foldcomp_audit container-report <encoded_structure>\n";
         return 1;
     }
@@ -860,6 +1717,13 @@ int main(int argc, char** argv) {
             return 1;
         }
         return commandCompare(argv[2], argv[3]);
+    }
+    if (command == "encoded-diff") {
+        if (argc < 4) {
+            std::cerr << "[Error] encoded-diff requires two encoded files\n";
+            return 1;
+        }
+        return commandEncodedDiff(argv[2], argv[3]);
     }
     if (command == "fallback-report") {
         return commandFallbackReport(argv[2]);
@@ -901,6 +1765,20 @@ int main(int argc, char** argv) {
     }
     if (command == "fragment-report") {
         return commandFragmentReport(argv[2]);
+    }
+    if (command == "trace-encode") {
+        int fragmentIndex = -1;
+        if (argc >= 4) {
+            fragmentIndex = std::stoi(argv[3]);
+        }
+        return commandTraceEncode(argv[2], fragmentIndex);
+    }
+    if (command == "trace-torsion-op") {
+        if (argc < 5) {
+            std::cerr << "[Error] trace-torsion-op requires structure, fragment_idx and torsion_idx\n";
+            return 1;
+        }
+        return commandTraceTorsionOp(argv[2], std::stoi(argv[3]), std::stoi(argv[4]));
     }
     if (command == "container-report") {
         return commandContainerReport(argv[2]);
