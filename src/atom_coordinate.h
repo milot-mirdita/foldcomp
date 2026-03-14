@@ -23,13 +23,13 @@ class AtomCoordinate {
 public:
     AtomCoordinate() = default;
     AtomCoordinate(
-        std::string a, std::string r, std::string c,
+        const std::string& a, const std::string& r, const std::string& c,
         int ai, int ri, float x, float y, float z,
         float occupancy = 0.0f, float tempFactor = 0.0f,
         int model = 1, char insertionCode = ' ', char altloc = ' '
     );
     AtomCoordinate(
-        std::string a, std::string r, std::string c,
+        const std::string& a, const std::string& r, const std::string& c,
         int ai, int ri, float3d coord,
         float occupancy = 0.0f, float tempFactor = 0.0f,
         int model = 1, char insertionCode = ' ', char altloc = ' '

@@ -155,49 +155,66 @@ bool residueRequiresRawEncoding(const tcb::span<const AtomCoordinate>& residueAt
     return false;
 }
 
-const AtomCoordinate* findAtomInRange(
-    tcb::span<const AtomCoordinate> atoms,
-    size_t start,
-    size_t end,
-    const char* atomName
-) {
-    for (size_t i = start; i < end; i++) {
-        if (atoms[i].atom == atomName) {
-            return &atoms[i];
-        }
-    }
-    return nullptr;
-}
+struct ResidueSummary {
+    size_t start;
+    size_t end;
+    int residueIndex;
+    const AtomCoordinate* n;
+    const AtomCoordinate* ca;
+    const AtomCoordinate* c;
+    bool requiresRawEncoding;
+};
 
-bool hasAbnormalPeptideGap(
-    tcb::span<const AtomCoordinate> atoms,
-    size_t previousResidueStart,
-    size_t previousResidueEnd,
-    size_t currentResidueStart,
-    size_t currentResidueEnd
-) {
-    const AtomCoordinate* prevC = findAtomInRange(atoms, previousResidueStart, previousResidueEnd, "C");
-    const AtomCoordinate* currN = findAtomInRange(atoms, currentResidueStart, currentResidueEnd, "N");
-    if (prevC == nullptr || currN == nullptr) {
+bool hasAbnormalPeptideGap(const ResidueSummary& previousResidue, const ResidueSummary& currentResidue) {
+    if (previousResidue.c == nullptr || currentResidue.n == nullptr) {
         return false;
     }
-    float dx = prevC->coordinate.x - currN->coordinate.x;
-    float dy = prevC->coordinate.y - currN->coordinate.y;
-    float dz = prevC->coordinate.z - currN->coordinate.z;
+    float dx = previousResidue.c->coordinate.x - currentResidue.n->coordinate.x;
+    float dy = previousResidue.c->coordinate.y - currentResidue.n->coordinate.y;
+    float dz = previousResidue.c->coordinate.z - currentResidue.n->coordinate.z;
     float distanceSquared = dx * dx + dy * dy + dz * dz;
     return distanceSquared > MAX_PEPTIDE_BOND_DISTANCE_SQUARED;
 }
 
-size_t findResidueEnd(
-    const std::vector<AtomCoordinate>& atoms,
-    size_t residueStart,
-    size_t chainEnd
+std::vector<ResidueSummary> buildResidueSummaries(
+    const tcb::span<const AtomCoordinate>& atoms,
+    size_t offset = 0
 ) {
-    size_t residueEnd = residueStart + 1;
-    while (residueEnd < chainEnd && !startsNewResidue(atoms[residueEnd], atoms[residueEnd - 1])) {
-        residueEnd++;
+    std::vector<ResidueSummary> summaries;
+    if (atoms.empty()) {
+        return summaries;
     }
-    return residueEnd;
+
+    summaries.reserve(atoms.size() / 4 + 1);
+    size_t residueStart = 0;
+    for (size_t i = 1; i <= atoms.size(); i++) {
+        bool endOfResidue = (i == atoms.size()) || startsNewResidue(atoms[i], atoms[i - 1]);
+        if (!endOfResidue) {
+            continue;
+        }
+
+        const AtomCoordinate* n = nullptr;
+        const AtomCoordinate* ca = nullptr;
+        const AtomCoordinate* c = nullptr;
+        for (size_t j = residueStart; j < i; j++) {
+            const AtomCoordinate& atom = atoms[j];
+            if (atom.atom == "N" && n == nullptr) {
+                n = &atom;
+            } else if (atom.atom == "CA" && ca == nullptr) {
+                ca = &atom;
+            } else if (atom.atom == "C" && c == nullptr) {
+                c = &atom;
+            }
+        }
+        summaries.push_back({
+            residueStart + offset, i + offset, atoms[residueStart].residue_index,
+            n, ca, c,
+            residueRequiresRawEncoding(tcb::span<const AtomCoordinate>(atoms.data() + residueStart, i - residueStart))
+        });
+        residueStart = i;
+    }
+
+    return summaries;
 }
 
 #ifdef FOLDCOMP_WITH_MMCIF_OUTPUT
@@ -244,7 +261,7 @@ gemmi::Element inferGemmiElement(const std::string& atomName) {
  * @param z A float for z coordinate
  */
 AtomCoordinate::AtomCoordinate(
-    std::string a, std::string r, std::string c,
+    const std::string& a, const std::string& r, const std::string& c,
     int ai, int ri, float x, float y, float z,
     float occupancy, float tempFactor, int model, char insertionCode, char altloc
 ): atom(a), residue(r), chain(c), atom_index(ai), residue_index(ri), occupancy(occupancy), tempFactor(tempFactor), model(model), insertion_code(insertionCode), altloc(altloc) {
@@ -261,7 +278,7 @@ AtomCoordinate::AtomCoordinate(
  * @param coord A float vector for x,y,z coordinates.
  */
 AtomCoordinate::AtomCoordinate(
-    std::string a, std::string r, std::string c,
+    const std::string& a, const std::string& r, const std::string& c,
     int ai, int ri, float3d coord,
     float occupancy, float tempFactor, int model, char insertionCode, char altloc
 ): atom(a), residue(r), chain(c), atom_index(ai), residue_index(ri), coordinate(coord), occupancy(occupancy), tempFactor(tempFactor), model(model), insertion_code(insertionCode), altloc(altloc) {
@@ -778,26 +795,18 @@ std::vector<std::pair<size_t, size_t>> identifyDiscontinousResInd(
     if (chain_start >= chain_end || chain_end > atoms.size()) {
         return output;
     }
+    tcb::span<const AtomCoordinate> chainSpan(atoms.data() + chain_start, chain_end - chain_start);
+    std::vector<ResidueSummary> summaries = buildResidueSummaries(chainSpan, chain_start);
+    if (summaries.empty()) {
+        return output;
+    }
     size_t start = chain_start;
-    size_t previousResidueStart = chain_start;
-    size_t previousResidueEnd = chain_start;
-    int previousResidueIndex = atoms[chain_start].residue_index;
-
-    for (size_t i = chain_start + 1; i < chain_end; i++) {
-        if (!startsNewResidue(atoms[i], atoms[i - 1])) {
-            continue;
+    for (size_t i = 1; i < summaries.size(); i++) {
+        if (summaries[i].residueIndex != summaries[i - 1].residueIndex + 1 ||
+            hasAbnormalPeptideGap(summaries[i - 1], summaries[i])) {
+            output.emplace_back(start, summaries[i].start);
+            start = summaries[i].start;
         }
-
-        previousResidueEnd = i;
-        int currentResidueIndex = atoms[i].residue_index;
-        size_t currentResidueEnd = findResidueEnd(atoms, i, chain_end);
-        if (currentResidueIndex != previousResidueIndex + 1 ||
-            hasAbnormalPeptideGap(atoms, previousResidueStart, previousResidueEnd, i, currentResidueEnd)) {
-            output.emplace_back(start, i);
-            start = i;
-        }
-        previousResidueIndex = currentResidueIndex;
-        previousResidueStart = i;
     }
     output.emplace_back(start, chain_end);
     return output;
@@ -811,42 +820,14 @@ std::vector<std::pair<size_t, size_t>> identifyCompleteBackboneRegions(
         return output;
     }
 
-    struct ResidueRegion {
-        size_t start;
-        size_t end;
-        bool completeBackbone;
-    };
-
-    std::vector<ResidueRegion> residues;
-    size_t residueStart = 0;
-    for (size_t i = 1; i <= atoms.size(); i++) {
-        bool endOfResidue = (i == atoms.size()) || startsNewResidue(atoms[i], atoms[i - 1]);
-        if (!endOfResidue) {
-            continue;
-        }
-
-        bool hasN = false;
-        bool hasCA = false;
-        bool hasC = false;
-        for (size_t j = residueStart; j < i; j++) {
-            if (atoms[j].atom == "N") {
-                hasN = true;
-            } else if (atoms[j].atom == "CA") {
-                hasCA = true;
-            } else if (atoms[j].atom == "C") {
-                hasC = true;
-            }
-        }
-        bool requiresRawEncoding = residueRequiresRawEncoding(
-            tcb::span<const AtomCoordinate>(atoms.data() + residueStart, i - residueStart)
-        );
-        residues.push_back({residueStart, i, hasN && hasCA && hasC && !requiresRawEncoding});
-        residueStart = i;
-    }
+    std::vector<ResidueSummary> residues = buildResidueSummaries(
+        tcb::span<const AtomCoordinate>(atoms.data(), atoms.size())
+    );
 
     size_t i = 0;
     while (i < residues.size()) {
-        if (!residues[i].completeBackbone) {
+        if (!(residues[i].n != nullptr && residues[i].ca != nullptr && residues[i].c != nullptr &&
+              !residues[i].requiresRawEncoding)) {
             i++;
             continue;
         }
@@ -854,7 +835,9 @@ std::vector<std::pair<size_t, size_t>> identifyCompleteBackboneRegions(
         size_t start = residues[i].start;
         size_t end = residues[i].end;
         i++;
-        while (i < residues.size() && residues[i].completeBackbone) {
+        while (i < residues.size() &&
+               residues[i].n != nullptr && residues[i].ca != nullptr && residues[i].c != nullptr &&
+               !residues[i].requiresRawEncoding) {
             end = residues[i].end;
             i++;
         }
@@ -871,46 +854,24 @@ std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordina
         return output;
     }
 
-    struct ResidueRegion {
-        size_t start;
-        size_t end;
-        bool completeBackbone;
-    };
-
-    std::vector<ResidueRegion> residues;
-    size_t residueStart = 0;
-    for (size_t i = 1; i <= atoms.size(); i++) {
-        bool endOfResidue = (i == atoms.size()) || startsNewResidue(atoms[i], atoms[i - 1]);
-        if (!endOfResidue) {
-            continue;
-        }
-
-        bool hasN = false;
-        bool hasCA = false;
-        bool hasC = false;
-        for (size_t j = residueStart; j < i; j++) {
-            if (atoms[j].atom == "N") {
-                hasN = true;
-            } else if (atoms[j].atom == "CA") {
-                hasCA = true;
-            } else if (atoms[j].atom == "C") {
-                hasC = true;
-            }
-        }
-        bool requiresRawEncoding = residueRequiresRawEncoding(
-            tcb::span<const AtomCoordinate>(atoms.data() + residueStart, i - residueStart)
-        );
-        residues.push_back({residueStart, i, hasN && hasCA && hasC && !requiresRawEncoding});
-        residueStart = i;
-    }
+    std::vector<ResidueSummary> residues = buildResidueSummaries(
+        tcb::span<const AtomCoordinate>(atoms.data(), atoms.size())
+    );
 
     size_t i = 0;
     while (i < residues.size()) {
-        if (!residues[i].completeBackbone) {
+        bool completeBackbone = residues[i].n != nullptr && residues[i].ca != nullptr &&
+                                residues[i].c != nullptr && !residues[i].requiresRawEncoding;
+        if (!completeBackbone) {
             size_t start = residues[i].start;
             size_t end = residues[i].end;
             i++;
-            while (i < residues.size() && !residues[i].completeBackbone) {
+            while (i < residues.size()) {
+                bool nextCompleteBackbone = residues[i].n != nullptr && residues[i].ca != nullptr &&
+                                            residues[i].c != nullptr && !residues[i].requiresRawEncoding;
+                if (nextCompleteBackbone) {
+                    break;
+                }
                 end = residues[i].end;
                 i++;
             }
@@ -922,7 +883,9 @@ std::vector<BackboneRegion> identifyBackboneRegions(const tcb::span<AtomCoordina
         size_t start = residues[i].start;
         size_t end = residues[i].end;
         i++;
-        while (i < residues.size() && residues[i].completeBackbone) {
+        while (i < residues.size() &&
+               residues[i].n != nullptr && residues[i].ca != nullptr && residues[i].c != nullptr &&
+               !residues[i].requiresRawEncoding) {
             end = residues[i].end;
             i++;
         }

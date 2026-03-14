@@ -51,6 +51,9 @@ std::map<std::string, float> calculateTorsionAngles(
 std::vector<float> calculateTorsionAnglesInResidue(
     const std::vector<AtomCoordinate>& originalAtoms, const AminoAcid& AA
 );
+std::vector<float> calculateTorsionAnglesInResidue(
+    const tcb::span<const AtomCoordinate>& originalAtoms, const AminoAcid& AA
+);
 
 std::vector< std::vector<float> > calculateSideChainTorsionAnglesPerResidue(
     const tcb::span<AtomCoordinate>& originalAtoms, const std::map<std::string, AminoAcid>& AAmap

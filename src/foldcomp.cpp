@@ -524,6 +524,7 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
     this->compressedBackBone.clear();
     this->compressedSideChain.clear();
     this->residues.clear();
+    this->backbone.clear();
     this->residueThreeLetter.clear();
     this->backboneTorsionAngles.clear();
     this->backboneBondAngles.clear();
@@ -551,29 +552,42 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
     // Keep only residues with complete backbone (N/CA/C).
     std::vector<AtomCoordinate> encodableAtoms;
     std::vector<std::pair<size_t, size_t>> residueRanges = splitResidueRanges(atoms);
+    encodableAtoms.reserve(atoms.size());
+    this->backbone.reserve(residueRanges.size() * 3);
+    this->residueThreeLetter.reserve(residueRanges.size());
+    this->tempFactors.reserve(residueRanges.size());
     for (const auto& residue : residueRanges) {
-        bool hasN = false;
-        bool hasCA = false;
-        bool hasC = false;
+        const AtomCoordinate* n = nullptr;
+        const AtomCoordinate* ca = nullptr;
+        const AtomCoordinate* c = nullptr;
         for (size_t i = residue.first; i < residue.second; i++) {
             const auto& atom = atoms[i];
             if (atom.atom == "N") {
-                hasN = true;
+                if (n == nullptr) {
+                    n = &atom;
+                }
             } else if (atom.atom == "CA") {
-                hasCA = true;
+                if (ca == nullptr) {
+                    ca = &atom;
+                }
             } else if (atom.atom == "C") {
-                hasC = true;
+                if (c == nullptr) {
+                    c = &atom;
+                }
             }
         }
-        if (hasN && hasCA && hasC) {
+        if (n != nullptr && ca != nullptr && c != nullptr) {
             encodableAtoms.insert(encodableAtoms.end(), atoms.begin() + residue.first, atoms.begin() + residue.second);
+            this->backbone.emplace_back(*n);
+            this->backbone.emplace_back(*ca);
+            this->backbone.emplace_back(*c);
+            this->residueThreeLetter.push_back(atoms[residue.first].residue);
+            this->tempFactors.push_back(ca->tempFactor);
         }
     }
     if (encodableAtoms.empty()) {
         return -1;
     }
-
-    this->backbone = filterBackbone(encodableAtoms);
     if (this->backbone.size() < 6 || (this->backbone.size() % 3) != 0) {
         return -1;
     }
@@ -647,9 +661,6 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
     this->c_n_ca_angleDisc = Discretizer(this->c_n_ca_angle, pow(2, NUM_BITS_BOND) - 1);
     this->c_n_ca_angleDiscretized = this->c_n_ca_angleDisc.discretize(this->c_n_ca_angle);
 
-    // Set residue names
-    this->residueThreeLetter = getResidueNameVector(encodableAtoms);
-
     // Set Discretizer for side chain
     this->sideChainDiscMap = initializeSideChainDiscMap();
     // Calculate side chain info
@@ -669,11 +680,6 @@ int Foldcomp::preprocess(const tcb::span<AtomCoordinate>& atoms) {
 
     // Get tempFactors
     // 2022-08-31 16:28:30 - Changed to save one tempFactor per residue
-    for (size_t i = 0; i < encodableAtoms.size(); i++) {
-        if (encodableAtoms[i].atom == "CA") {
-            this->tempFactors.push_back(encodableAtoms[i].tempFactor);
-        }
-    }
     // Discretize
     this->tempFactorsDisc = Discretizer(this->tempFactors, pow(2, NUM_BITS_TEMP) - 1);
     this->tempFactorsDiscretized = this->tempFactorsDisc.discretize(this->tempFactors);

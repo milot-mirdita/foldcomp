@@ -83,6 +83,13 @@ static bool residueNeedsRawFallback(const tcb::span<const AtomCoordinate>& resid
     if (residueAtoms.empty()) {
         return false;
     }
+    auto aaIt = Foldcomp::AAS.find(residueAtoms[0].residue);
+    if (aaIt == Foldcomp::AAS.end()) {
+        return true;
+    }
+
+    int matchedCanonicalAtoms = 0;
+    bool hasOxt = false;
     for (const auto& atom : residueAtoms) {
         if (atom.altloc != ' ' && atom.altloc != '\0') {
             return true;
@@ -90,34 +97,42 @@ static bool residueNeedsRawFallback(const tcb::span<const AtomCoordinate>& resid
         if (atom.insertion_code != ' ' && atom.insertion_code != '\0') {
             return true;
         }
-    }
-    auto aaIt = Foldcomp::AAS.find(residueAtoms[0].residue);
-    if (aaIt == Foldcomp::AAS.end()) {
-        return true;
-    }
-    std::set<std::string> sourceAtoms;
-    for (const auto& atom : residueAtoms) {
-        sourceAtoms.insert(atom.atom);
-    }
-
-    std::set<std::string> canonicalAtoms(aaIt->second.atoms.begin(), aaIt->second.atoms.end());
-    std::set<std::string> canonicalAtomsWithOxt = canonicalAtoms;
-    canonicalAtomsWithOxt.insert("OXT");
-
-    for (const auto& atom : sourceAtoms) {
-        if (canonicalAtomsWithOxt.find(atom) == canonicalAtomsWithOxt.end()) {
+        if (atom.atom == "OXT") {
+            if (hasOxt) {
+                return true;
+            }
+            hasOxt = true;
+            continue;
+        }
+        bool found = false;
+        for (const auto& canonicalAtom : aaIt->second.atoms) {
+            if (atom.atom == canonicalAtom) {
+                matchedCanonicalAtoms++;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
             return true;
         }
     }
-    return sourceAtoms != canonicalAtoms && sourceAtoms != canonicalAtomsWithOxt;
+    int expectedAtomCount = static_cast<int>(aaIt->second.atoms.size()) + (hasOxt ? 1 : 0);
+    return static_cast<int>(residueAtoms.size()) != expectedAtomCount ||
+           matchedCanonicalAtoms != static_cast<int>(aaIt->second.atoms.size());
 }
 
 static bool regionNeedsRawFallback(const tcb::span<AtomCoordinate>& atoms) {
-    std::vector<std::pair<size_t, size_t>> residues = splitResidueRanges(atoms);
     size_t residuesWithOxt = 0;
-    for (size_t i = 0; i < residues.size(); i++) {
+    size_t residueStart = 0;
+    size_t residueCount = 0;
+    for (size_t i = 1; i <= atoms.size(); i++) {
+        bool endOfResidue = (i == atoms.size()) || startsNewResidue(atoms[i], atoms[i - 1]);
+        if (!endOfResidue) {
+            continue;
+        }
+        residueCount++;
         bool hasOxt = false;
-        for (size_t j = residues[i].first; j < residues[i].second; j++) {
+        for (size_t j = residueStart; j < i; j++) {
             const auto& atom = atoms[j];
             if (atom.atom == "OXT") {
                 hasOxt = true;
@@ -125,41 +140,47 @@ static bool regionNeedsRawFallback(const tcb::span<AtomCoordinate>& atoms) {
             }
         }
         if (!hasOxt) {
-            continue;
+        } else {
+            residuesWithOxt++;
+            if (residuesWithOxt > 1 || i != atoms.size()) {
+                return true;
+            }
         }
-        residuesWithOxt++;
-        if (i + 1 != residues.size()) {
-            return true;
-        }
-    }
-    if (residuesWithOxt > 1) {
-        return true;
-    }
-    for (const auto& residue : residues) {
         if (residueNeedsRawFallback(
-                tcb::span<const AtomCoordinate>(atoms.data() + residue.first, residue.second - residue.first))) {
+                tcb::span<const AtomCoordinate>(atoms.data() + residueStart, i - residueStart))) {
             return true;
         }
+        residueStart = i;
     }
     return false;
 }
 
+static size_t countResidues(const tcb::span<AtomCoordinate>& atoms) {
+    if (atoms.empty()) {
+        return 0;
+    }
+    size_t residueCount = 1;
+    for (size_t i = 1; i < atoms.size(); i++) {
+        if (startsNewResidue(atoms[i], atoms[i - 1])) {
+            residueCount++;
+        }
+    }
+    return residueCount;
+}
+
 static bool shouldStoreSmallMixedFragmentAsRaw(
     const tcb::span<AtomCoordinate>& chainSpan,
-    const std::vector<BackboneRegion>& regions
+    const std::vector<BackboneRegion>& regions,
+    const std::vector<bool>& regionNeedsRaw
 ) {
     if (regions.size() <= 1) {
         return false;
     }
-    if (splitResidueRanges(chainSpan).size() > 24) {
+    if (countResidues(chainSpan) > 24) {
         return false;
     }
-    for (const auto& region : regions) {
-        tcb::span<AtomCoordinate> regionSpan(
-            chainSpan.data() + region.start,
-            chainSpan.data() + region.end
-        );
-        if (!region.encodable || regionNeedsRawFallback(regionSpan)) {
+    for (size_t i = 0; i < regions.size(); i++) {
+        if (!regions[i].encodable || regionNeedsRaw[i]) {
             return true;
         }
     }
@@ -744,7 +765,18 @@ int main(int argc, char* const *argv) {
                             std::cerr << "[Warning] Skipping empty fragment: " << base << std::endl;
                             continue;
                         }
-                        if (shouldStoreSmallMixedFragmentAsRaw(chain_span, regions)) {
+                        std::vector<bool> region_needs_raw(regions.size(), false);
+                        for (size_t region_index = 0; region_index < regions.size(); region_index++) {
+                            if (!regions[region_index].encodable) {
+                                continue;
+                            }
+                            tcb::span<AtomCoordinate> region_span(
+                                chain_span.data() + regions[region_index].start,
+                                chain_span.data() + regions[region_index].end
+                            );
+                            region_needs_raw[region_index] = regionNeedsRawFallback(region_span);
+                        }
+                        if (shouldStoreSmallMixedFragmentAsRaw(chain_span, regions, region_needs_raw)) {
                             std::cerr << "[Warning] Using raw encoding for short mixed fragment: "
                                       << base << std::endl;
                             ContainerFragment containerFragment;
@@ -760,7 +792,8 @@ int main(int argc, char* const *argv) {
                             encodedFragments.push_back(std::move(containerFragment));
                             continue;
                         }
-                        for (const auto& region : regions) {
+                        for (size_t region_index = 0; region_index < regions.size(); region_index++) {
+                            const auto& region = regions[region_index];
                             tcb::span<AtomCoordinate> region_span(
                                 chain_span.data() + region.start,
                                 chain_span.data() + region.end
@@ -768,7 +801,7 @@ int main(int argc, char* const *argv) {
                             ContainerFragment containerFragment;
                             containerFragment.model = chain_span[region.start].model;
                             containerFragment.chain = chain_span[region.start].chain;
-                            bool useFoldcompEncoding = region.encodable && !regionNeedsRawFallback(region_span);
+                            bool useFoldcompEncoding = region.encodable && !region_needs_raw[region_index];
                             if (useFoldcompEncoding) {
                                 Foldcomp compRes;
                                 compRes.strTitle = title;

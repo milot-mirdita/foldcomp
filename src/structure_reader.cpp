@@ -36,6 +36,26 @@ std::string basePath(const std::string& path) {
     return path;
 }
 
+bool isProteinLikeResidue(gemmi::Residue& res) {
+    gemmi::ResidueInfo resInfo = gemmi::find_tabulated_residue(res.name);
+    if (resInfo.found() && resInfo.is_amino_acid()) {
+        return true;
+    }
+    bool hasN = false;
+    bool hasCA = false;
+    bool hasC = false;
+    for (const gemmi::Atom& atom : res.atoms) {
+        if (atom.name == "N") {
+            hasN = true;
+        } else if (atom.name == "CA") {
+            hasCA = true;
+        } else if (atom.name == "C") {
+            hasC = true;
+        }
+    }
+    return hasN && hasCA && hasC;
+}
+
 }
 
 /**
@@ -61,41 +81,33 @@ void StructureReader::updateStructure(void* void_st, const std::string& filename
         this->title = filename;
     }
 
+    size_t totalAtoms = 0;
+    for (gemmi::Model& model : st->models) {
+        for (gemmi::Chain& ch : model.chains) {
+            for (gemmi::Residue& res : ch.residues) {
+                if (isProteinLikeResidue(res)) {
+                    totalAtoms += res.atoms.size();
+                }
+            }
+        }
+    }
+    this->atoms.reserve(totalAtoms);
+
     for (size_t modelIndex = 0; modelIndex < st->models.size(); modelIndex++) {
         gemmi::Model& model = st->models[modelIndex];
         for (gemmi::Chain& ch : model.chains) {
             for (gemmi::Residue& res : ch.residues) {
-                gemmi::ResidueInfo resInfo = gemmi::find_tabulated_residue(res.name);
-                bool isProteinLike = resInfo.found() && resInfo.is_amino_acid();
-                if (!isProteinLike) {
-                    // Fallback for modified/unknown residues with peptide-like backbone atoms.
-                    // mmCIF roundtrips do not always preserve Gemmi's polymer entity typing.
-                    bool hasN = false;
-                    bool hasCA = false;
-                    bool hasC = false;
-                    for (const gemmi::Atom& atom : res.atoms) {
-                        if (atom.name == "N") {
-                            hasN = true;
-                        } else if (atom.name == "CA") {
-                            hasCA = true;
-                        } else if (atom.name == "C") {
-                            hasC = true;
-                        }
-                    }
-                    isProteinLike = (hasN && hasCA && hasC);
-                }
-                if (!isProteinLike) {
+                if (!isProteinLikeResidue(res)) {
                     continue;
                 }
                 for (gemmi::Atom& atom : res.atoms) {
-                    AtomCoordinate ac = AtomCoordinate(
+                    this->atoms.emplace_back(
                         atom.name, res.name, ch.name, atom.serial, (int)res.seqid.num,
                         (float)atom.pos.x, (float)atom.pos.y, (float)atom.pos.z,
                         (float)atom.occ, (float)atom.b_iso, static_cast<int>(modelIndex + 1),
                         res.seqid.icode == '\0' ? ' ' : res.seqid.icode,
                         atom.altloc == '\0' ? ' ' : atom.altloc
                     );
-                    this->atoms.push_back(ac);
                 }
             }
         }
