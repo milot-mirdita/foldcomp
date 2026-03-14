@@ -296,6 +296,8 @@ private:
         std::vector<unsigned int>& input, std::vector< std::vector<float> >& output
     );
 
+    float computeBackboneRmsdForCompressedState() const;
+
 public:
     bool isPreprocessed = false;
     bool isCompressed = false;
@@ -384,7 +386,6 @@ public:
     std::vector<BackboneChain> compress(const tcb::span<AtomCoordinate>& atoms);
     int decompressBackbone(std::vector<AtomCoordinate>& atoms);
     int decompress(std::vector<AtomCoordinate>& atoms);
-    float computeBackboneRmsdForCompressedState() const;
     bool exceedsBackboneRmsdThreshold(float maxBackboneRmsd) const;
     int read(const char* data, size_t size);
     int writeString(std::string& output);

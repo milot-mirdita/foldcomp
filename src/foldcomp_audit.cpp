@@ -14,7 +14,9 @@
 #include <fstream>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <map>
+#include <numeric>
 #include <set>
 #include <sstream>
 #include <string>
@@ -36,6 +38,7 @@ struct Summary {
 };
 
 using ResidueKey = std::tuple<int, std::string, int, int>;
+using RmsdResidueKey = std::tuple<int, std::string, int, int>;
 namespace fs = std::filesystem;
 
 struct ParsedFczPayload {
@@ -71,6 +74,13 @@ struct TraceFragmentSelection {
 
 Summary summarize(const std::vector<AtomCoordinate>& atoms);
 std::map<ResidueKey, ResidueStats> groupResidues(const std::vector<AtomCoordinate>& atoms);
+std::map<RmsdResidueKey, std::vector<AtomCoordinate>> groupResiduesForRmsd(const std::vector<AtomCoordinate>& atoms);
+bool calculateAlignedRmsd(
+    const std::vector<AtomCoordinate>& atoms1,
+    const std::vector<AtomCoordinate>& atoms2,
+    float& backboneRmsd,
+    float& allAtomRmsd
+);
 bool parseFczPayload(const std::string& payload, ParsedFczPayload& parsed);
 bool firstHeaderFieldDiff(const ParsedFczPayload& left, const ParsedFczPayload& right, HeaderFieldDiff& diff);
 bool findTraceFragment(const std::vector<AtomCoordinate>& atoms, int selectedFragmentIndex, TraceFragmentSelection& selection);
@@ -735,6 +745,121 @@ int compareAtomVectors(const std::vector<AtomCoordinate>& sourceAtoms,
     return 0;
 }
 
+std::map<RmsdResidueKey, std::vector<AtomCoordinate>> groupResiduesForRmsd(
+    const std::vector<AtomCoordinate>& atoms
+) {
+    std::map<RmsdResidueKey, std::vector<AtomCoordinate>> residues;
+    if (atoms.empty()) {
+        return residues;
+    }
+    std::map<std::tuple<int, std::string, int, char, std::string>, int> occurrences;
+    size_t residueStart = 0;
+    for (size_t i = 1; i <= atoms.size(); i++) {
+        bool endOfResidue = (i == atoms.size()) ||
+                            startsNewResidue(atoms[i], atoms[i - 1]);
+        if (!endOfResidue) {
+            continue;
+        }
+        const AtomCoordinate& first = atoms[residueStart];
+        std::tuple<int, std::string, int, char, std::string> baseKey(
+            first.model, first.chain, first.residue_index, first.insertion_code, first.residue
+        );
+        RmsdResidueKey key(
+            first.model, first.chain, first.residue_index, occurrences[baseKey]++
+        );
+        std::vector<AtomCoordinate>& residue = residues[key];
+        residue.insert(residue.end(), atoms.begin() + residueStart, atoms.begin() + i);
+        residueStart = i;
+    }
+    return residues;
+}
+
+bool calculateAlignedRmsd(
+    const std::vector<AtomCoordinate>& atoms1,
+    const std::vector<AtomCoordinate>& atoms2,
+    float& backboneRmsd,
+    float& allAtomRmsd
+) {
+    backboneRmsd = 0.0f;
+    allAtomRmsd = 0.0f;
+    if (atoms1.empty() || atoms2.empty() || atoms1.size() != atoms2.size()) {
+        return false;
+    }
+
+    std::vector<AtomCoordinate> alignedAtoms1;
+    std::vector<AtomCoordinate> alignedAtoms2;
+    std::vector<AtomCoordinate> alignedBackbone1;
+    std::vector<AtomCoordinate> alignedBackbone2;
+
+    std::map<RmsdResidueKey, std::vector<AtomCoordinate>> residues1 = groupResiduesForRmsd(atoms1);
+    std::map<RmsdResidueKey, std::vector<AtomCoordinate>> residues2 = groupResiduesForRmsd(atoms2);
+    if (residues1.size() != residues2.size()) {
+        return false;
+    }
+
+    auto atomSorter = [](const AtomCoordinate& a, const AtomCoordinate& b) {
+        if (a.atom != b.atom) {
+            return a.atom < b.atom;
+        }
+        if (a.residue != b.residue) {
+            return a.residue < b.residue;
+        }
+        if (a.chain != b.chain) {
+            return a.chain < b.chain;
+        }
+        return a.atom_index < b.atom_index;
+    };
+
+    for (const auto& kv : residues1) {
+        auto it = residues2.find(kv.first);
+        if (it == residues2.end() || kv.second.empty() || it->second.empty()) {
+            return false;
+        }
+        const AtomCoordinate& left = kv.second.front();
+        const AtomCoordinate& right = it->second.front();
+        if (left.residue != right.residue || kv.second.size() != it->second.size()) {
+            return false;
+        }
+
+        std::vector<AtomCoordinate> sorted1 = kv.second;
+        std::vector<AtomCoordinate> sorted2 = it->second;
+        std::sort(sorted1.begin(), sorted1.end(), atomSorter);
+        std::sort(sorted2.begin(), sorted2.end(), atomSorter);
+        for (size_t atomIdx = 0; atomIdx < sorted1.size(); atomIdx++) {
+            if (sorted1[atomIdx].atom != sorted2[atomIdx].atom) {
+                return false;
+            }
+            alignedAtoms1.push_back(sorted1[atomIdx]);
+            alignedAtoms2.push_back(sorted2[atomIdx]);
+        }
+
+        auto appendBackboneAtom = [&](const std::string& atomName) {
+            auto leftIt = std::find_if(
+                sorted1.begin(), sorted1.end(),
+                [&](const AtomCoordinate& atom) { return atom.atom == atomName; }
+            );
+            auto rightIt = std::find_if(
+                sorted2.begin(), sorted2.end(),
+                [&](const AtomCoordinate& atom) { return atom.atom == atomName; }
+            );
+            if (leftIt != sorted1.end() && rightIt != sorted2.end()) {
+                alignedBackbone1.push_back(*leftIt);
+                alignedBackbone2.push_back(*rightIt);
+            }
+        };
+        appendBackboneAtom("N");
+        appendBackboneAtom("CA");
+        appendBackboneAtom("C");
+    }
+
+    if (alignedAtoms1.empty() || alignedBackbone1.empty()) {
+        return false;
+    }
+    backboneRmsd = RMSD(alignedBackbone1, alignedBackbone2);
+    allAtomRmsd = RMSD(alignedAtoms1, alignedAtoms2);
+    return true;
+}
+
 int commandCompare(const std::string& source, const std::string& roundtrip) {
     StructureReader sourceReader;
     StructureReader roundtripReader;
@@ -804,6 +929,142 @@ int commandDbEntryCompare(const std::string& sourcePath, const std::string& dbPa
 
     removeAlternativePosition(dbAtoms);
     return compareAtomVectors(sourceAtoms, dbAtoms);
+}
+
+std::string bucketizeRmsd(float value, const std::vector<float>& bins) {
+    float lower = bins.front();
+    for (size_t i = 1; i < bins.size(); i++) {
+        float upper = bins[i];
+        if (value <= upper) {
+            std::ostringstream oss;
+            if (std::isinf(upper)) {
+                oss << ">" << std::fixed << std::setprecision(2) << lower;
+            } else {
+                oss << std::fixed << std::setprecision(2) << lower
+                    << "-" << std::fixed << std::setprecision(2) << upper;
+            }
+            return oss.str();
+        }
+        lower = upper;
+    }
+    return "unreachable";
+}
+
+void printHistogram(const std::string& label, const std::map<std::string, size_t>& histogram) {
+    for (const auto& kv : histogram) {
+        std::cout << label << " bucket=" << kv.first << " count=" << kv.second << "\n";
+    }
+}
+
+int commandDbRmsd(const std::string& sourceDir, const std::string& dbPath, bool recursive) {
+    std::vector<std::string> files = getFilesInDirectory(sourceDir, recursive);
+    std::sort(files.begin(), files.end());
+
+    void* reader = make_reader(dbPath.c_str(), (dbPath + ".index").c_str(),
+                               DB_READER_USE_DATA | DB_READER_USE_LOOKUP);
+    if (reader == NULL) {
+        std::cerr << "[Error] Failed to open database " << dbPath << "\n";
+        return 1;
+    }
+
+    const std::vector<float> backboneBins = {0.0f, 0.01f, 0.02f, 0.05f, 0.1f, 0.2f, 0.5f, 1.0f, std::numeric_limits<float>::infinity()};
+    const std::vector<float> allAtomBins = {0.0f, 0.02f, 0.05f, 0.1f, 0.2f, 0.5f, 1.0f, 2.0f, std::numeric_limits<float>::infinity()};
+
+    size_t totalFiles = 0;
+    size_t proteinFiles = 0;
+    size_t matchedFiles = 0;
+    size_t missingEntries = 0;
+    size_t decodeFailures = 0;
+    size_t rmsdFailures = 0;
+    std::vector<float> backboneValues;
+    std::vector<float> allAtomValues;
+    std::map<std::string, size_t> backboneHistogram;
+    std::map<std::string, size_t> allAtomHistogram;
+
+    for (const auto& file : files) {
+        totalFiles++;
+        StructureReader sourceReader;
+        if (!sourceReader.load(file)) {
+            continue;
+        }
+        std::vector<AtomCoordinate> sourceAtoms;
+        sourceReader.readAllAtoms(sourceAtoms);
+        removeAlternativePosition(sourceAtoms);
+        if (sourceAtoms.empty()) {
+            continue;
+        }
+        proteinFiles++;
+
+        std::string dbKeyStr = sourcePathToDbKey(file);
+        uint32_t key = reader_lookup_entry(reader, dbKeyStr.c_str());
+        if (key == UINT32_MAX) {
+            std::cout << "missing_db_entry " << baseName(file) << " key=" << dbKeyStr << "\n";
+            missingEntries++;
+            continue;
+        }
+        int64_t id = reader_get_id(reader, key);
+        if (id == -1) {
+            std::cout << "missing_db_id " << baseName(file) << " key=" << dbKeyStr << "\n";
+            missingEntries++;
+            continue;
+        }
+
+        std::vector<AtomCoordinate> dbAtoms;
+        const char* data = reader_get_data(reader, id);
+        int64_t length = reader_get_length(reader, id);
+        if (data == NULL || length <= 0 || !decodeEntryToAtoms(data, static_cast<size_t>(length), dbAtoms)) {
+            std::cout << "decode_failure " << baseName(file) << " key=" << dbKeyStr << "\n";
+            decodeFailures++;
+            continue;
+        }
+        removeAlternativePosition(dbAtoms);
+
+        float backboneRmsd = 0.0f;
+        float allAtomRmsd = 0.0f;
+        if (!calculateAlignedRmsd(sourceAtoms, dbAtoms, backboneRmsd, allAtomRmsd)) {
+            std::cout << "rmsd_failure " << baseName(file) << " key=" << dbKeyStr << "\n";
+            rmsdFailures++;
+            continue;
+        }
+
+        matchedFiles++;
+        backboneValues.push_back(backboneRmsd);
+        allAtomValues.push_back(allAtomRmsd);
+        backboneHistogram[bucketizeRmsd(backboneRmsd, backboneBins)]++;
+        allAtomHistogram[bucketizeRmsd(allAtomRmsd, allAtomBins)]++;
+    }
+    free_reader(reader);
+
+    auto printStats = [](const std::string& prefix, const std::vector<float>& values) {
+        if (values.empty()) {
+            return;
+        }
+        std::vector<float> sorted = values;
+        std::sort(sorted.begin(), sorted.end());
+        float mean = std::accumulate(sorted.begin(), sorted.end(), 0.0f) / static_cast<float>(sorted.size());
+        float median = sorted[sorted.size() / 2];
+        if ((sorted.size() % 2) == 0) {
+            median = 0.5f * (sorted[sorted.size() / 2 - 1] + sorted[sorted.size() / 2]);
+        }
+        std::cout << prefix
+                  << " mean=" << mean
+                  << " median=" << median
+                  << " max=" << sorted.back()
+                  << "\n";
+    };
+
+    std::cout << "files_total=" << totalFiles
+              << " protein_files=" << proteinFiles
+              << " matched_files=" << matchedFiles
+              << " missing_entries=" << missingEntries
+              << " decode_failures=" << decodeFailures
+              << " rmsd_failures=" << rmsdFailures
+              << "\n";
+    printStats("backbone_rmsd", backboneValues);
+    printStats("all_atom_rmsd", allAtomValues);
+    printHistogram("backbone_hist", backboneHistogram);
+    printHistogram("all_atom_hist", allAtomHistogram);
+    return 0;
 }
 
 int commandDumpResidues(const std::string& sourcePath) {
@@ -1697,6 +1958,7 @@ int main(int argc, char** argv) {
                   << "  foldcomp_audit encoded-diff <left_encoded> <right_encoded>\n"
                   << "  foldcomp_audit fallback-report <structure_or_directory>\n"
                   << "  foldcomp_audit db-compare [--recursive] <source_directory> <db>\n"
+                  << "  foldcomp_audit db-rmsd [--recursive] <source_directory> <db>\n"
                   << "  foldcomp_audit db-entry-compare <source_structure> <db>\n"
                   << "  foldcomp_audit dump-residues <structure>\n"
                   << "  foldcomp_audit db-entry-dump-residues <source_structure> <db>\n"
@@ -1745,6 +2007,24 @@ int main(int argc, char** argv) {
             recursive = looksLikeDividedRoot(sourceDir);
         }
         return commandDbCompare(sourceDir, dbPath, recursive);
+    }
+    if (command == "db-rmsd") {
+        bool recursive = false;
+        int argIndex = 2;
+        if (argc >= 3 && std::string(argv[2]) == "--recursive") {
+            recursive = true;
+            argIndex++;
+        }
+        if (argc < argIndex + 2) {
+            std::cerr << "[Error] db-rmsd requires source_directory and db path\n";
+            return 1;
+        }
+        const std::string sourceDir = argv[argIndex];
+        const std::string dbPath = argv[argIndex + 1];
+        if (!recursive) {
+            recursive = looksLikeDividedRoot(sourceDir);
+        }
+        return commandDbRmsd(sourceDir, dbPath, recursive);
     }
     if (command == "db-entry-compare") {
         if (argc < 4) {
